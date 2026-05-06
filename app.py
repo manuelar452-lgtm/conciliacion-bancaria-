@@ -19,13 +19,22 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
 
-# Forzar paths de binarios del sistema (Python 3.14 no los hereda del PATH)
+import subprocess as _sp
+
 def _find_bin(name):
-    for d in ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin",
-              "/usr/share/tesseract-ocr/5/tessdata/../../../bin"):
+    for d in ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"):
         p = os.path.join(d, name)
         if os.path.isfile(p):
             return p
+    # buscar con find en /usr
+    try:
+        r = _sp.run(["find", "/usr", "-name", name, "-type", "f", "-maxdepth", "6"],
+                    capture_output=True, text=True, timeout=5)
+        hits = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        if hits:
+            return hits[0]
+    except Exception:
+        pass
     return shutil.which(name)
 
 _POPPLER_PATH = next(
@@ -43,6 +52,15 @@ st.set_page_config(
 )
 
 st.title("🏦 Conciliación Bancaria")
+
+with st.expander("Diagnóstico del sistema", expanded=False):
+    st.code(f"tesseract: {_TESSERACT_BIN or 'NO ENCONTRADO'}\npoppler:   {_POPPLER_PATH or 'NO ENCONTRADO'}")
+    try:
+        r = _sp.run(["find", "/usr", "-name", "tesseract", "-maxdepth", "6"],
+                    capture_output=True, text=True, timeout=5)
+        st.code(f"find tesseract:\n{r.stdout or '(nada)'}")
+    except Exception as e:
+        st.code(f"find error: {e}")
 
 col_a, col_b = st.columns(2)
 uploaded_ext = col_a.file_uploader("📄 Extracto bancario (PDF)", type="pdf")
