@@ -431,29 +431,29 @@ if st.button("Generar conciliación", type="primary"):
                 columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
 
         def parse_auxiliar():
-            """Procesa auxiliar: pdfplumber primero, OCR como fallback."""
+            """Procesa auxiliar con pdfplumber (sin OCR)."""
             all_rows = []
-            images = None
+            aux_sample = []
             try:
                 with pdfplumber.open(pdf_aux_path) as pdf:
-                    for page in pdf.pages:
+                    for pg, page in enumerate(pdf.pages, 1):
+                        if pg == 1:
+                            lines_p, _ = _plumber_lines(page)
+                            aux_sample = [
+                                " | ".join(t for _, t in ln)
+                                for ln in lines_p[:8]
+                            ]
                         df_p = _parse_informe_plumber(page)
                         if not df_p.empty:
                             all_rows.append(df_p)
-            except Exception:
-                all_rows = []
+            except Exception as e:
+                aux_sample = [f"ERROR: {e}"]
 
-            if not all_rows or sum(len(d) for d in all_rows) < 5:
-                all_rows = []
-                images = _pdf_to_images(pdf_aux_path, dpi=150)
-                for img in images:
-                    df_page = parse_informe(img)
-                    if not df_page.empty:
-                        all_rows.append(df_page)
-
+            st.session_state["aux_sample"] = aux_sample
             if not all_rows:
-                return pd.DataFrame(columns=["comprobante","fecha","descripcion","debito","credito","saldo"]), images
-            return pd.concat(all_rows, ignore_index=True), images
+                return pd.DataFrame(
+                    columns=["comprobante","fecha","descripcion","debito","credito","saldo"]), None
+            return pd.concat(all_rows, ignore_index=True), None
 
         # ── Matching ──────────────────────────────────────────────────────────
         def reconciliar(df_ext, df_inf, diferencia_saldos):
