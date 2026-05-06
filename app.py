@@ -19,18 +19,22 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
 
-# Detectar dónde está poppler (pdftoppm) en este sistema
-def _find_poppler():
-    for cmd in ("pdftoppm", "pdfinfo", "pdftocairo"):
-        p = shutil.which(cmd)
-        if p:
-            return os.path.dirname(p)
-    for candidate in ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"):
-        if os.path.exists(os.path.join(candidate, "pdftoppm")):
-            return candidate
-    return None
+# Forzar paths de binarios del sistema (Python 3.14 no los hereda del PATH)
+def _find_bin(name):
+    for d in ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin",
+              "/usr/share/tesseract-ocr/5/tessdata/../../../bin"):
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    return shutil.which(name)
 
-_POPPLER_PATH = _find_poppler()
+_POPPLER_PATH = next(
+    (d for d in ("/usr/bin", "/usr/local/bin") if os.path.isfile(os.path.join(d, "pdftoppm"))),
+    None
+)
+_TESSERACT_BIN = _find_bin("tesseract")
+if _TESSERACT_BIN:
+    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_BIN
 
 st.set_page_config(
     page_title="Conciliación Bancaria",
@@ -283,17 +287,23 @@ if st.button("Generar conciliación", type="primary"):
             plumber_sample = []   # primeras líneas de página 1 para debug
             try:
                 with pdfplumber.open(pdf_ext_path) as pdf:
+                    n_pages = len(pdf.pages)
                     for pg, page in enumerate(pdf.pages, 1):
+                        words = page.extract_words(x_tolerance=3, y_tolerance=3)
                         lines, w = _plumber_lines(page)
                         if pg == 1:
+                            raw_text = page.extract_text() or ""
                             plumber_sample = [
+                                f"Páginas: {n_pages} | Palabras p1: {len(words)} | Ancho: {round(w,1)}",
+                                f"Texto raw p1 (primeras 300 chars): {raw_text[:300]!r}",
+                            ] + [
                                 " | ".join(t for _, t in ln)
                                 for ln in lines[:8]
                             ]
                         page_rows = _parse_extracto_page(lines, w)
                         filas_por_pagina.append((pg, len(page_rows), "pdf"))
                         all_rows.extend(page_rows)
-                plumber_ok = True   # terminó sin excepción
+                plumber_ok = True
             except Exception as e:
                 all_rows = []
                 plumber_sample = [f"ERROR: {e}"]
