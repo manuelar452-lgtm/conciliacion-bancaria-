@@ -235,10 +235,11 @@ if st.button("Generar conciliación", type="primary"):
                                 return v
             return None
 
-        def parse_extracto(images, ano, mes):
-            # ── Intento 1: pdfplumber (lee texto directo del PDF, sin OCR) ──────
+        def parse_extracto(ano, mes):
+            # ── Intento 1: pdfplumber (lee texto directo, sin OCR) ──────────────
             all_rows = []
             filas_por_pagina = []
+            images = None  # solo se convierten si pdfplumber falla
             try:
                 with pdfplumber.open(pdf_ext_path) as pdf:
                     for pg, page in enumerate(pdf.pages, 1):
@@ -249,24 +250,26 @@ if st.button("Generar conciliación", type="primary"):
             except Exception:
                 all_rows = []
 
-            # ── Intento 2: OCR (fallback si el PDF no tiene capa de texto) ──────
+            # ── Intento 2: OCR (fallback, solo si pdfplumber no extrajo filas) ──
             if len(all_rows) < 5:
                 all_rows = []
                 filas_por_pagina = []
+                images = convert_from_path(pdf_ext_path, dpi=150)
                 for pg, img in enumerate(images, 1):
                     page_rows = _parse_extracto_page(_ocr_lines(img), img.width)
                     filas_por_pagina.append((pg, len(page_rows), "ocr"))
                     all_rows.extend(page_rows)
 
             st.session_state["ext_debug"] = filas_por_pagina
-            if not all_rows: return pd.DataFrame()
+            if not all_rows:
+                return pd.DataFrame(), images
             df = pd.DataFrame(all_rows)
             def _make_date(row):
                 m = int(row["mes"]) if pd.notna(row.get("mes")) and row.get("mes") else mes
                 max_day = 28 if m == 2 else 30 if m in [4,6,9,11] else 31
                 return date(ano, m, min(int(row["dia"]), max_day))
             df["fecha"] = df.apply(_make_date, axis=1)
-            return df.sort_values("fecha").reset_index(drop=True)
+            return df.sort_values("fecha").reset_index(drop=True), images
 
         # ── Informe Movimiento General (última página) ────────────────────────
         # Sin posiciones fijas: usa delta de saldo para determinar débito/crédito
@@ -376,10 +379,10 @@ if st.button("Generar conciliación", type="primary"):
             return pd.DataFrame(rows) if rows else pd.DataFrame(
                 columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
 
-        def parse_auxiliar(images):
+        def parse_auxiliar():
             """Procesa auxiliar: pdfplumber primero, OCR como fallback."""
-            # Intento 1: pdfplumber
             all_rows = []
+            images = None
             try:
                 with pdfplumber.open(pdf_aux_path) as pdf:
                     for page in pdf.pages:
@@ -389,17 +392,17 @@ if st.button("Generar conciliación", type="primary"):
             except Exception:
                 all_rows = []
 
-            # Intento 2: OCR fallback
             if not all_rows or sum(len(d) for d in all_rows) < 5:
                 all_rows = []
+                images = convert_from_path(pdf_aux_path, dpi=150)
                 for img in images:
                     df_page = parse_informe(img)
                     if not df_page.empty:
                         all_rows.append(df_page)
 
             if not all_rows:
-                return pd.DataFrame(columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
-            return pd.concat(all_rows, ignore_index=True)
+                return pd.DataFrame(columns=["comprobante","fecha","descripcion","debito","credito","saldo"]), images
+            return pd.concat(all_rows, ignore_index=True), images
 
         # ── Matching ──────────────────────────────────────────────────────────
         def reconciliar(df_ext, df_inf, diferencia_saldos):
@@ -724,22 +727,21 @@ if st.button("Generar conciliación", type="primary"):
             else:
                 ano, mes = date.today().year, date.today().month
 
-        images_ext = convert_from_path(pdf_ext_path, dpi=200)
-        images_aux = convert_from_path(pdf_aux_path, dpi=200)
-
-        df_ext = parse_extracto(images_ext, ano, mes)
-        # Primero buscar "Saldo Final" en el texto del extracto (más confiable)
-        saldo_ext = _saldo_final_extracto(images_ext)
-        # Fallback: último saldo de la tabla
+        # Procesar extracto (pdfplumber directo; imágenes solo si OCR es necesario)
+        df_ext, images_ext = parse_extracto(ano, mes)
+        _ext_saldos = df_ext["saldo"].dropna() if not df_ext.empty else pd.Series(dtype=float)
+        saldo_ext = float(_ext_saldos.iloc[-1]) if not _ext_saldos.empty else None
+        # Buscar "Saldo Final" en OCR solo si la tabla no tiene saldo
         if saldo_ext is None:
-            _ext_saldos = df_ext["saldo"].dropna() if not df_ext.empty else pd.Series(dtype=float)
-            saldo_ext = float(_ext_saldos.iloc[-1]) if not _ext_saldos.empty else None
+            if images_ext is None:
+                images_ext = convert_from_path(pdf_ext_path, dpi=150)
+            saldo_ext = _saldo_final_extracto(images_ext)
 
-        df_inf = parse_auxiliar(images_aux)
+        # Procesar auxiliar (pdfplumber directo; imágenes solo si OCR es necesario)
+        df_inf, images_aux = parse_auxiliar()
         _inf_saldos = df_inf["saldo"].dropna() if not df_inf.empty else pd.Series(dtype=float)
         saldo_cont = float(_inf_saldos.iloc[-1]) if not _inf_saldos.empty else None
-        # Buscar también "Saldo Final" / "TOTAL" en el texto del auxiliar como validación
-        if saldo_cont is None:
+        if saldo_cont is None and images_aux is not None:
             for img in images_aux:
                 text = pytesseract.image_to_string(img, lang="spa", config="--psm 6")
                 for line in text.split("\n"):
