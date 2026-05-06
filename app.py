@@ -1,11 +1,12 @@
 from __future__ import annotations
 import os
 import re
+import shutil
 import tempfile
 import numpy as np
 import pandas as pd
 from datetime import date, datetime, timedelta
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, convert_from_bytes
 import pytesseract
 try:
     import pdfplumber
@@ -17,6 +18,19 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
+
+# Detectar dónde está poppler (pdftoppm) en este sistema
+def _find_poppler():
+    for cmd in ("pdftoppm", "pdfinfo", "pdftocairo"):
+        p = shutil.which(cmd)
+        if p:
+            return os.path.dirname(p)
+    for candidate in ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"):
+        if os.path.exists(os.path.join(candidate, "pdftoppm")):
+            return candidate
+    return None
+
+_POPPLER_PATH = _find_poppler()
 
 st.set_page_config(
     page_title="Conciliación Bancaria",
@@ -258,7 +272,10 @@ if st.button("Generar conciliación", type="primary"):
             if len(all_rows) < 5:
                 all_rows = []
                 filas_por_pagina = []
-                images = convert_from_path(pdf_ext_path, dpi=150)
+                with open(pdf_ext_path, "rb") as f:
+                    pdf_bytes = f.read()
+                images = convert_from_bytes(pdf_bytes, dpi=150,
+                                            poppler_path=_POPPLER_PATH)
                 for pg, img in enumerate(images, 1):
                     page_rows = _parse_extracto_page(_ocr_lines(img), img.width)
                     filas_por_pagina.append((pg, len(page_rows), "ocr"))
@@ -398,7 +415,10 @@ if st.button("Generar conciliación", type="primary"):
 
             if not all_rows or sum(len(d) for d in all_rows) < 5:
                 all_rows = []
-                images = convert_from_path(pdf_aux_path, dpi=150)
+                with open(pdf_aux_path, "rb") as f:
+                    aux_bytes = f.read()
+                images = convert_from_bytes(aux_bytes, dpi=150,
+                                            poppler_path=_POPPLER_PATH)
                 for img in images:
                     df_page = parse_informe(img)
                     if not df_page.empty:
@@ -738,7 +758,9 @@ if st.button("Generar conciliación", type="primary"):
         # Buscar "Saldo Final" en OCR solo si la tabla no tiene saldo
         if saldo_ext is None:
             if images_ext is None:
-                images_ext = convert_from_path(pdf_ext_path, dpi=150)
+                with open(pdf_ext_path, "rb") as f:
+                    images_ext = convert_from_bytes(f.read(), dpi=150,
+                                                    poppler_path=_POPPLER_PATH)
             saldo_ext = _saldo_final_extracto(images_ext)
 
         # Procesar auxiliar (pdfplumber directo; imágenes solo si OCR es necesario)
