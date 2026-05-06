@@ -253,11 +253,32 @@ if st.button("Generar conciliación", type="primary"):
                                 return v
             return None
 
+        def _pdf_to_images(pdf_path, dpi=150):
+            """Convierte PDF a imágenes PIL sin necesitar poppler del sistema."""
+            # Intento 1: pdfplumber (usa pypdfium2 internamente en v0.11+)
+            try:
+                imgs = []
+                with pdfplumber.open(pdf_path) as pdf:
+                    for page in pdf.pages:
+                        imgs.append(page.to_image(resolution=dpi).original)
+                if imgs:
+                    return imgs
+            except Exception:
+                pass
+            # Intento 2: pdf2image con poppler
+            try:
+                with open(pdf_path, "rb") as f:
+                    return convert_from_bytes(f.read(), dpi=dpi,
+                                              poppler_path=_POPPLER_PATH)
+            except Exception:
+                pass
+            return []
+
         def parse_extracto(ano, mes):
-            # ── Intento 1: pdfplumber (lee texto directo, sin OCR) ──────────────
+            # ── Intento 1: pdfplumber texto directo (sin OCR, sin poppler) ───────
             all_rows = []
             filas_por_pagina = []
-            images = None  # solo se convierten si pdfplumber falla
+            images = None
             try:
                 with pdfplumber.open(pdf_ext_path) as pdf:
                     for pg, page in enumerate(pdf.pages, 1):
@@ -268,14 +289,11 @@ if st.button("Generar conciliación", type="primary"):
             except Exception:
                 all_rows = []
 
-            # ── Intento 2: OCR (fallback, solo si pdfplumber no extrajo filas) ──
+            # ── Intento 2: OCR sobre imagen renderizada por pdfplumber ───────────
             if len(all_rows) < 5:
                 all_rows = []
                 filas_por_pagina = []
-                with open(pdf_ext_path, "rb") as f:
-                    pdf_bytes = f.read()
-                images = convert_from_bytes(pdf_bytes, dpi=150,
-                                            poppler_path=_POPPLER_PATH)
+                images = _pdf_to_images(pdf_ext_path, dpi=150)
                 for pg, img in enumerate(images, 1):
                     page_rows = _parse_extracto_page(_ocr_lines(img), img.width)
                     filas_por_pagina.append((pg, len(page_rows), "ocr"))
@@ -415,10 +433,7 @@ if st.button("Generar conciliación", type="primary"):
 
             if not all_rows or sum(len(d) for d in all_rows) < 5:
                 all_rows = []
-                with open(pdf_aux_path, "rb") as f:
-                    aux_bytes = f.read()
-                images = convert_from_bytes(aux_bytes, dpi=150,
-                                            poppler_path=_POPPLER_PATH)
+                images = _pdf_to_images(pdf_aux_path, dpi=150)
                 for img in images:
                     df_page = parse_informe(img)
                     if not df_page.empty:
@@ -758,9 +773,7 @@ if st.button("Generar conciliación", type="primary"):
         # Buscar "Saldo Final" en OCR solo si la tabla no tiene saldo
         if saldo_ext is None:
             if images_ext is None:
-                with open(pdf_ext_path, "rb") as f:
-                    images_ext = convert_from_bytes(f.read(), dpi=150,
-                                                    poppler_path=_POPPLER_PATH)
+                images_ext = _pdf_to_images(pdf_ext_path, dpi=150)
             saldo_ext = _saldo_final_extracto(images_ext)
 
         # Procesar auxiliar (pdfplumber directo; imágenes solo si OCR es necesario)
