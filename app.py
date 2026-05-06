@@ -778,31 +778,32 @@ if st.button("Generar conciliación", type="primary"):
             else:
                 ano, mes = date.today().year, date.today().month
 
-        # Procesar extracto (pdfplumber directo; imágenes solo si OCR es necesario)
-        df_ext, images_ext = parse_extracto(ano, mes)
+        # Procesar extracto — pdfplumber lee texto directo, sin OCR
+        df_ext, _images_ext = parse_extracto(ano, mes)
         _ext_saldos = df_ext["saldo"].dropna() if not df_ext.empty else pd.Series(dtype=float)
         saldo_ext = float(_ext_saldos.iloc[-1]) if not _ext_saldos.empty else None
-        # Buscar "Saldo Final" en OCR solo si la tabla no tiene saldo
-        if saldo_ext is None:
-            if images_ext is None:
-                images_ext = _pdf_to_images(pdf_ext_path, dpi=150)
-            saldo_ext = _saldo_final_extracto(images_ext)
 
-        # Procesar auxiliar (pdfplumber directo; imágenes solo si OCR es necesario)
-        df_inf, images_aux = parse_auxiliar()
+        # Si pdfplumber no encontró saldo, intentar buscar en texto del PDF
+        if saldo_ext is None and not df_ext.empty:
+            try:
+                with pdfplumber.open(pdf_ext_path) as pdf:
+                    for page in reversed(pdf.pages):
+                        txt = page.extract_text() or ""
+                        for line in txt.split("\n"):
+                            if re.search(r"saldo\s+(final|al\s+corte|bancario)", line, re.IGNORECASE):
+                                nums = re.findall(r"[\d,]+\.\d{2}", line)
+                                for n in nums:
+                                    v = _to_float(n)
+                                    if v and v > 0:
+                                        saldo_ext = v; break
+                        if saldo_ext: break
+            except Exception:
+                pass
+
+        # Procesar auxiliar — pdfplumber lee texto directo, sin OCR
+        df_inf, _images_aux = parse_auxiliar()
         _inf_saldos = df_inf["saldo"].dropna() if not df_inf.empty else pd.Series(dtype=float)
         saldo_cont = float(_inf_saldos.iloc[-1]) if not _inf_saldos.empty else None
-        if saldo_cont is None and images_aux is not None:
-            for img in images_aux:
-                text = pytesseract.image_to_string(img, lang="spa", config="--psm 6")
-                for line in text.split("\n"):
-                    if re.search(r"(saldo\s+final|total\s+general|total\s+cuenta)", line, re.IGNORECASE):
-                        nums = re.findall(r"[\d,]+\.\d{2}", line)
-                        for n in nums:
-                            v = _to_float(n)
-                            if v and v > 0:
-                                saldo_cont = v; break
-                if saldo_cont: break
 
         diferencia_saldos = round((saldo_ext or 0) - (saldo_cont or 0), 2)
         cheques, notas_cargo, notas_abono, ingresos, matching_ok = reconciliar(
