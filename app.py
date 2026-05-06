@@ -848,18 +848,30 @@ if st.button("Generar conciliación", type="primary"):
     )
 
     with st.expander("Ver movimientos del extracto"):
-        st.dataframe(df_ext[["fecha","dia","descripcion","debito","credito","saldo"]], use_container_width=True)
+        cols_ext = [c for c in ["fecha","dia","descripcion","debito","credito","saldo"] if c in df_ext.columns]
+        if cols_ext:
+            st.dataframe(df_ext[cols_ext], use_container_width=True)
+        else:
+            st.warning("pdfplumber no extrajo filas del extracto — ver texto de debug abajo.")
         debug = st.session_state.get("ext_debug", [])
         if debug:
             modo = debug[0][2] if debug else "?"
-            st.caption(f"Modo: {'pdfplumber ✓' if modo=='pdf' else 'OCR (fallback)'} — "
-                       "Filas por página: " +
-                       " | ".join(f"P{p}:{n}" for p, n, _ in debug))
+            st.caption(f"Modo: {'pdfplumber ✓' if modo=='pdf' else 'OCR'} — "
+                       "Filas/página: " + " | ".join(f"P{p}:{n}" for p, n, _ in debug))
         sample = st.session_state.get("plumber_sample", [])
         if sample:
-            st.caption("Primeras líneas que leyó pdfplumber (pág 1):")
+            st.caption("**Texto que leyó pdfplumber del extracto (pág 1) — cópiame esto:**")
             for ln in sample:
                 st.code(ln)
 
     with st.expander("Ver asientos del contador"):
-        st.dataframe(df_inf[["comprobante","fecha","descripcion","debito","credito","saldo"]], use_container_width=True)
+        cols_inf = [c for c in ["comprobante","fecha","descripcion","debito","credito","saldo"] if c in df_inf.columns]
+        if cols_inf:
+            st.dataframe(df_inf[cols_inf], use_container_width=True)
+        else:
+            st.warning("pdfplumber no extrajo filas del auxiliar.")
+        aux_sample = st.session_state.get("aux_sample", [])
+        if aux_sample:
+            st.caption("**Texto que leyó pdfplumber del auxiliar (pág 1) — cópiame esto:**")
+            for ln in aux_sample:
+                st.code(ln)
