@@ -275,31 +275,43 @@ if st.button("Generar conciliación", type="primary"):
             return []
 
         def parse_extracto(ano, mes):
-            # ── Intento 1: pdfplumber texto directo (sin OCR, sin poppler) ───────
+            # pdfplumber: lee texto directo del PDF (sin OCR, sin poppler)
             all_rows = []
             filas_por_pagina = []
             images = None
+            plumber_ok = False
+            plumber_sample = []   # primeras líneas de página 1 para debug
             try:
                 with pdfplumber.open(pdf_ext_path) as pdf:
                     for pg, page in enumerate(pdf.pages, 1):
                         lines, w = _plumber_lines(page)
+                        if pg == 1:
+                            plumber_sample = [
+                                " | ".join(t for _, t in ln)
+                                for ln in lines[:8]
+                            ]
                         page_rows = _parse_extracto_page(lines, w)
                         filas_por_pagina.append((pg, len(page_rows), "pdf"))
                         all_rows.extend(page_rows)
-            except Exception:
+                plumber_ok = True   # terminó sin excepción
+            except Exception as e:
                 all_rows = []
+                plumber_sample = [f"ERROR: {e}"]
 
-            # ── Intento 2: OCR sobre imagen renderizada por pdfplumber ───────────
-            if len(all_rows) < 5:
-                all_rows = []
-                filas_por_pagina = []
+            st.session_state["plumber_sample"] = plumber_sample
+
+            # Solo usar OCR si pdfplumber lanzó excepción (no por pocas filas)
+            if not plumber_ok:
                 images = _pdf_to_images(pdf_ext_path, dpi=150)
                 for pg, img in enumerate(images, 1):
-                    page_rows = _parse_extracto_page(_ocr_lines(img), img.width)
+                    try:
+                        page_rows = _parse_extracto_page(_ocr_lines(img), img.width)
+                    except Exception:
+                        page_rows = []
                     filas_por_pagina.append((pg, len(page_rows), "ocr"))
                     all_rows.extend(page_rows)
+                st.session_state["ext_debug"] = filas_por_pagina
 
-            st.session_state["ext_debug"] = filas_por_pagina
             if not all_rows:
                 return pd.DataFrame(), images
             df = pd.DataFrame(all_rows)
@@ -842,6 +854,11 @@ if st.button("Generar conciliación", type="primary"):
             st.caption(f"Modo: {'pdfplumber ✓' if modo=='pdf' else 'OCR (fallback)'} — "
                        "Filas por página: " +
                        " | ".join(f"P{p}:{n}" for p, n, _ in debug))
+        sample = st.session_state.get("plumber_sample", [])
+        if sample:
+            st.caption("Primeras líneas que leyó pdfplumber (pág 1):")
+            for ln in sample:
+                st.code(ln)
 
     with st.expander("Ver asientos del contador"):
         st.dataframe(df_inf[["comprobante","fecha","descripcion","debito","credito","saldo"]], use_container_width=True)
