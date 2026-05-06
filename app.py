@@ -7,7 +7,11 @@ import pandas as pd
 from datetime import date, datetime, timedelta
 from pdf2image import convert_from_path
 import pytesseract
-import pdfplumber
+try:
+    import pdfplumber
+    _HAS_PDFPLUMBER = True
+except Exception:
+    _HAS_PDFPLUMBER = False
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
