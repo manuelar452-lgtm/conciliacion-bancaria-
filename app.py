@@ -745,101 +745,53 @@ if st.button("Generar conciliación", type="primary"):
             cv.border = _BRD
             cv.alignment = Alignment(horizontal="right")
 
-        def build_excel(df_ext, df_inf, cheques, notas_cargo, notas_abono, ingresos,
-                        saldo_ext, saldo_cont, nombre_pdf, matching_confiable=True):
+        def build_excel(df_ext, df_inf, saldo_ext, saldo_cont, nombre_pdf, partida_faltante):
             wb = Workbook()
             ws = wb.active; ws.title = "Conciliacion"
-            for col, w in zip("ABCDE", [14, 40, 18, 18, 18]):
-                ws.column_dimensions[col].width = w
+            for col, cw in zip("AB", [38, 26]):
+                ws.column_dimensions[col].width = cw
 
-            # ── Título ────────────────────────────────────────────────────────
-            _merge_row(ws, 1, "CONCILIACIÓN BANCARIA",
-                       PatternFill("solid", fgColor="1F3864"),
-                       font_kw={"size":16,"bold":True,"color":"FFFFFF"},
-                       height=32)
-            ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
-
-            _merge_row(ws, 2, f"{nombre_pdf}   |   {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                       PatternFill("solid", fgColor="F2F2F2"),
-                       font_kw={"bold":False,"size":9,"color":"666666"})
-            ws["A2"].alignment = Alignment(horizontal="center")
-
-            # ── Saldos ────────────────────────────────────────────────────────
-            r = 4
             diferencia = round((saldo_ext or 0) - (saldo_cont or 0), 2)
-            _kv(ws, r,   "SALDO EXTRACTO BANCARIO",   _fmt_cop(saldo_ext),  _GRN); r += 1
-            _kv(ws, r,   "SALDO CONTABILIDAD",        _fmt_cop(saldo_cont), _GRN); r += 1
-            _kv(ws, r,   "DIFERENCIA A CONCILIAR",    _fmt_cop(diferencia),
-                _GRN if diferencia == 0 else _YELL); r += 1
 
-            if not matching_confiable:
-                _merge_row(ws, r,
-                    "⚠️  El extracto bancario agrupa pagos en lotes (dispersiones) y usa fechas valor distintas a "
-                    "la contabilidad. El sistema no puede cruzar automáticamente las partidas individuales. "
-                    "La diferencia a conciliar es la indicada arriba. Revisa las hojas 'Extracto' y 'Auxiliar' "
-                    "para identificar el origen de la diferencia.",
-                    PatternFill("solid", fgColor="FFF2CC"),
-                    font_kw={"bold": False, "size": 9, "color": "7F4F00"})
-                ws[f"A{r}"].alignment = Alignment(wrap_text=True, vertical="top")
-                ws.row_dimensions[r].height = 52
-                r += 2
-            else:
-                r += 1
+            # Título
+            ws.merge_cells("A1:B1")
+            c = ws["A1"]
+            c.value = "CONCILIACIÓN BANCARIA"
+            c.font = Font(bold=True, size=14, color="FFFFFF")
+            c.fill = PatternFill("solid", fgColor="1F3864")
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            ws.row_dimensions[1].height = 30
 
-            # ── Cheques pendientes de cobro ───────────────────────────────────
-            _merge_row(ws, r, "CHEQUES PENDIENTES DE COBRO", _YELL); r += 1
-            _hrow(ws, r, ["FECHA","BENEFICIARIO","No. COMPROBANTE","DOC","VALOR"]); r += 1
-            if cheques.empty:
-                _merge_row(ws, r, "—", PatternFill(), font_kw={"bold":False,"size":9,"color":"999999"}); r += 1
-            else:
-                for _, row in cheques.iterrows():
-                    _drow(ws, r, [str(row.fecha), row.beneficiario, row.comprobante, "", _fmt_cop(row.monto)]); r += 1
-            _total_row(ws, r, "TOTAL CHEQUES PENDIENTES POR COBRAR",
-                       _fmt_cop(cheques.monto.sum()) if not cheques.empty else _fmt_cop(0)); r += 2
+            ws.merge_cells("A2:B2")
+            c2 = ws["A2"]
+            c2.value = f"{nombre_pdf}   |   {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            c2.font = Font(size=9, color="666666")
+            c2.fill = PatternFill("solid", fgColor="F2F2F2")
+            c2.alignment = Alignment(horizontal="center")
 
-            # ── Disfones devueltos ────────────────────────────────────────────
-            _merge_row(ws, r, "DISFONES DEVUELTOS", _YELL); r += 1
-            _total_row(ws, r, "TOTAL DISFONES DEVUELTOS POR GIRAR", _fmt_cop(0)); r += 2
+            _kv(ws, 4, "SALDO EXTRACTO BANCARIO", _fmt_cop(saldo_ext),  _GRN)
+            _kv(ws, 5, "SALDO CONTABILIDAD",       _fmt_cop(saldo_cont), _GRN)
+            _kv(ws, 6, "DIFERENCIA",               _fmt_cop(diferencia),
+                _GRN if diferencia == 0 else _RED)
 
-            # ── Notas no contabilizadas ───────────────────────────────────────
-            _merge_row(ws, r, "NOTAS NO CONTABILIZADAS", _YELL); r += 1
-            _hrow(ws, r, ["FECHA","DESCRIPCIÓN","CARGO","ABONO",""]); r += 1
-            for _, row in notas_cargo.iterrows():
-                _drow(ws, r, [str(row.fecha), row.descripcion, _fmt_cop(row.monto), "", ""]); r += 1
-            for _, row in notas_abono.iterrows():
-                _drow(ws, r, [str(row.fecha), row.descripcion, "", _fmt_cop(row.monto), ""]); r += 1
-            if notas_cargo.empty and notas_abono.empty:
-                _merge_row(ws, r, "—", PatternFill(), font_kw={"bold":False,"size":9,"color":"999999"}); r += 1
-            total_notas = (notas_cargo.monto.sum() if not notas_cargo.empty else 0) + \
-                          (notas_abono.monto.sum() if not notas_abono.empty else 0)
-            _total_row(ws, r, "TOTAL NOTAS NO CONTABILIZADAS", _fmt_cop(total_notas)); r += 2
+            if partida_faltante:
+                ws.merge_cells("A8:B8")
+                lbl = ws["A8"]
+                lbl.value = "PARTIDA FALTANTE IDENTIFICADA"
+                lbl.font = Font(bold=True, size=11, color="7F4F00")
+                lbl.fill = _YELL
+                lbl.alignment = Alignment(horizontal="center", vertical="center")
+                ws.row_dimensions[8].height = 22
 
-            # ── Ingresos pendientes por contabilizar ──────────────────────────
-            _merge_row(ws, r, "INGRESOS PENDIENTES POR CONTABILIZAR", _YELL); r += 1
-            _hrow(ws, r, ["FECHA","DESCRIPCIÓN","No. COMPROBANTE","","VALOR"]); r += 1
-            if ingresos.empty:
-                _merge_row(ws, r, "—", PatternFill(), font_kw={"bold":False,"size":9,"color":"999999"}); r += 1
-            else:
-                for _, row in ingresos.iterrows():
-                    _drow(ws, r, [str(row.fecha), row.descripcion, row.comprobante, "", _fmt_cop(row.monto)]); r += 1
-            _total_row(ws, r, "TOTAL INGRESOS PENDIENTES POR CONTABILIZAR",
-                       _fmt_cop(ingresos.monto.sum()) if not ingresos.empty else _fmt_cop(0)); r += 2
+                _kv(ws, 9,  "Fecha",       str(partida_faltante["fecha"]),       _YELL)
+                _kv(ws, 10, "Descripción", partida_faltante["descripcion"],      _YELL)
+                _kv(ws, 11, "Monto",       _fmt_cop(partida_faltante["monto"]),  _YELL)
+                _kv(ws, 12, "Tipo",        partida_faltante["tipo"],             _YELL)
+                _kv(ws, 13, "Origen",      partida_faltante["origen"],           _YELL)
 
-            # ── Diferencia conciliada ─────────────────────────────────────────
-            # Fórmula:
-            # dif_conciliada = diferencia - cheques + ingresos + notas_cargo - notas_abono
-            tc = cheques.monto.sum()  if not cheques.empty  else 0
-            ti = ingresos.monto.sum() if not ingresos.empty else 0
-            tnc = notas_cargo.monto.sum()  if not notas_cargo.empty  else 0
-            tna = notas_abono.monto.sum()  if not notas_abono.empty  else 0
-            dif_conciliada = round(diferencia - tc + ti + tnc - tna, 2)
-
-            fill_conc = _GRN if abs(dif_conciliada) < 1 else _RED
-            _kv(ws, r, "DIFERENCIA CONCILIADA", _fmt_cop(dif_conciliada), fill_conc)
-
-            # ── Hoja 2: Extracto (detalle) ────────────────────────────────────
+            # Hoja Extracto
             ws2 = wb.create_sheet("Extracto")
-            for col, w in zip("ABCDEF",[12,8,45,22,22,26]): ws2.column_dimensions[col].width = w
+            for col, cw in zip("ABCDEF",[12,8,45,22,22,26]): ws2.column_dimensions[col].width = cw
             _hrow(ws2, 1, ["Fecha","Día","Descripción","Débito","Crédito","Saldo"])
             for i,(_, row) in enumerate(df_ext.iterrows(), 2):
                 fill = _GRN if i%2==0 else _GREY
@@ -848,9 +800,9 @@ if st.button("Generar conciliación", type="primary"):
                     _fmt_cop(row.credito) if row.credito>0 else "",
                     _fmt_cop(row.saldo)], fill)
 
-            # ── Hoja 3: Auxiliar contable (detalle) ───────────────────────────
+            # Hoja Auxiliar
             ws3 = wb.create_sheet("Auxiliar")
-            for col, w in zip("ABCDEF",[18,12,40,22,22,26]): ws3.column_dimensions[col].width = w
+            for col, cw in zip("ABCDEF",[18,12,40,22,22,26]): ws3.column_dimensions[col].width = cw
             _hrow(ws3, 1, ["Comprobante","Fecha","Descripción","Débito","Crédito","Saldo"])
             for i,(_, row) in enumerate(df_inf.iterrows(), 2):
                 fill = _GRN if i%2==0 else _GREY
@@ -858,91 +810,6 @@ if st.button("Generar conciliación", type="primary"):
                     _fmt_cop(row.debito) if row.debito>0 else "",
                     _fmt_cop(row.credito) if row.credito>0 else "",
                     _fmt_cop(row.saldo)], fill)
-
-            # ── Hoja 4: Comparativo — todo lo que no cruzó ────────────────────
-            ws4 = wb.create_sheet("Comparativo")
-            # Anchos: Fecha, Descripción, Monto | Comprobante, Fecha, Descripción, Monto
-            for col, cw in zip("ABCDEFG",[12,40,20,18,12,40,20]):
-                ws4.column_dimensions[col].width = cw
-
-            # Título
-            ws4.merge_cells("A1:G1")
-            t1 = ws4["A1"]
-            t1.value = "COMPARATIVO DE MOVIMIENTOS SIN CRUZAR"
-            t1.font = Font(bold=True, size=13, color="FFFFFF")
-            t1.fill = PatternFill("solid", fgColor="1F3864")
-            t1.alignment = Alignment(horizontal="center", vertical="center")
-            ws4.row_dimensions[1].height = 28
-
-            # Subtítulos de cada columna
-            ws4.merge_cells("A2:C2")
-            lbl_ext = ws4["A2"]
-            lbl_ext.value = f"EXTRACTO BANCO  ({len(notas_cargo)+len(notas_abono)} mov sin cruzar)"
-            lbl_ext.font = Font(bold=True, size=10, color="FFFFFF")
-            lbl_ext.fill = PatternFill("solid", fgColor="C00000")
-            lbl_ext.alignment = Alignment(horizontal="center")
-
-            ws4.merge_cells("E2:G2")
-            lbl_aux = ws4["E2"]
-            lbl_aux.value = f"AUXILIAR CONTABILIDAD  ({len(cheques)+len(ingresos)} mov sin cruzar)"
-            lbl_aux.font = Font(bold=True, size=10, color="FFFFFF")
-            lbl_aux.fill = PatternFill("solid", fgColor="375623")
-            lbl_aux.alignment = Alignment(horizontal="center")
-
-            # Cabeceras
-            for c, v in enumerate(["Fecha","Descripción","Monto"], 1):
-                cell = ws4.cell(row=3, column=c, value=v)
-                cell.font = Font(bold=True, color="FFFFFF", size=9)
-                cell.fill = _RED; cell.border = _BRD
-                cell.alignment = Alignment(horizontal="center")
-            for c, v in enumerate(["Comprobante","Fecha","Descripción","Monto"], 5):
-                cell = ws4.cell(row=3, column=c, value=v)
-                cell.font = Font(bold=True, color="FFFFFF", size=9)
-                cell.fill = _GRN; cell.border = _BRD
-                cell.alignment = Alignment(horizontal="center")
-
-            # Datos lado extracto (cargos y abonos sin cruzar)
-            ext_sin = (
-                [{"fecha": r["fecha"], "desc": r["descripcion"],
-                  "monto": f'-{_fmt_cop(r["monto"])}' } for r in notas_cargo.to_dict("records")] +
-                [{"fecha": r["fecha"], "desc": r["descripcion"],
-                  "monto": _fmt_cop(r["monto"])}        for r in notas_abono.to_dict("records")]
-            )
-            ext_sin.sort(key=lambda x: str(x["fecha"]))
-
-            # Datos lado auxiliar (débitos y créditos sin cruzar)
-            # ingresos tiene "descripcion"; cheques tiene "beneficiario"
-            aux_sin = (
-                [{"comp": r["comprobante"], "fecha": r["fecha"],
-                  "desc": r.get("descripcion", r.get("beneficiario", "")),
-                  "monto": _fmt_cop(r["monto"])}
-                 for r in ingresos.to_dict("records")] +
-                [{"comp": r["comprobante"], "fecha": r["fecha"],
-                  "desc": r.get("beneficiario", r.get("descripcion", "")),
-                  "monto": f'-{_fmt_cop(r["monto"])}'}
-                 for r in cheques.to_dict("records")]
-            )
-            aux_sin.sort(key=lambda x: str(x["fecha"]))
-
-            n_rows = max(len(ext_sin), len(aux_sin))
-            _RRED  = PatternFill("solid", fgColor="FCE4D6")
-            _RGRN  = PatternFill("solid", fgColor="E2EFDA")
-            for idx in range(n_rows):
-                r = idx + 4
-                if idx < len(ext_sin):
-                    e = ext_sin[idx]
-                    for c, v in enumerate([str(e["fecha"]), e["desc"], e["monto"]], 1):
-                        cell = ws4.cell(row=r, column=c, value=v)
-                        cell.fill = _RRED; cell.border = _BRD
-                        cell.alignment = Alignment(vertical="center",
-                            wrap_text=(c==2), horizontal=("right" if c==3 else "left"))
-                if idx < len(aux_sin):
-                    a = aux_sin[idx]
-                    for c, v in enumerate([a["comp"], str(a["fecha"]), a["desc"], a["monto"]], 5):
-                        cell = ws4.cell(row=r, column=c, value=v)
-                        cell.fill = _RGRN; cell.border = _BRD
-                        cell.alignment = Alignment(vertical="center",
-                            wrap_text=(c==7), horizontal=("right" if c==8 else "left"))
 
             buf = io.BytesIO()
             wb.save(buf)
@@ -983,16 +850,11 @@ if st.button("Generar conciliación", type="primary"):
         saldo_cont = float(_inf_saldos.iloc[-1]) if not _inf_saldos.empty else None
 
         diferencia_saldos = round((saldo_ext or 0) - (saldo_cont or 0), 2)
-        cheques, notas_cargo, notas_abono, ingresos, matching_ok = reconciliar(
-            df_ext, df_inf, diferencia_saldos
-        )
-
-        partida_faltante = _buscar_partida(df_ext, df_inf, diferencia_saldos)
+        partida_faltante  = _buscar_partida(df_ext, df_inf, diferencia_saldos)
 
         excel_buf, diferencia = build_excel(
-            df_ext, df_inf, cheques, notas_cargo, notas_abono, ingresos,
-            saldo_ext, saldo_cont, uploaded_ext.name,
-            matching_confiable=matching_ok,
+            df_ext, df_inf, saldo_ext, saldo_cont,
+            uploaded_ext.name, partida_faltante,
         )
 
         os.unlink(pdf_ext_path)
