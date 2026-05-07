@@ -138,14 +138,19 @@ if st.button("Generar conciliación", type="primary"):
         def _is_amount(text: str) -> bool:
             t = _clean(text)
             return bool(
-                # Con agrupación de comas → decimal opcional (OCR a veces lo pierde)
-                re.match(r"^-?\d{1,3}(,\d{3})+(\.\d{1,2})?$", t) or
-                # Sin comas → exige decimal para no confundir con referencias
-                re.match(r"^-?\d{4,}\.\d{2}$", t)
+                re.match(r"^-?\d{1,3}(,\d{3})+(\.\d{1,2})?$", t) or   # US: 1,334,847.00
+                re.match(r"^-?\d{4,}\.\d{2}$",                  t) or   # sin comas: 1334847.00
+                re.match(r"^-?\d{1,3}(\.\d{3})+(,\d{1,2})?$",  t) or   # EUR: 1.334.847,00
+                re.match(r"^-?\d{6,}$",                          t)      # entero sin formato
             )
 
         def _to_float(text: str):
-            t = _clean(text).replace(",", "")
+            t = _clean(text)
+            # Formato europeo: puntos como miles, coma como decimal → 1.334.847,00
+            if re.match(r"^-?\d{1,3}(\.\d{3})+(,\d{1,2})?$", t):
+                t = t.replace(".", "").replace(",", ".")
+            else:
+                t = t.replace(",", "")
             try:    return float(t)
             except: return None
 
@@ -611,6 +616,52 @@ if st.button("Generar conciliación", type="primary"):
                 True,
             )
 
+        def _buscar_partida(df_ext, df_inf, diferencia_saldos):
+            """
+            Compara los montos del extracto contra los del auxiliar (sin depender
+            de fechas).  Devuelve el movimiento del extracto cuyo monto no aparece
+            en el auxiliar y es el más cercano a la diferencia de saldos.
+            """
+            if df_ext.empty or df_inf.empty:
+                return None
+
+            # Multiset de montos del auxiliar redondeados a $100
+            aux_montos = []
+            for _, r in df_inf.iterrows():
+                if r.debito  > 0: aux_montos.append(round(r.debito  / 100) * 100)
+                if r.credito > 0: aux_montos.append(round(r.credito / 100) * 100)
+
+            def _en_auxiliar(monto, tol_pct=0.02):
+                bucket = round(monto / 100) * 100
+                tol    = max(round(monto * tol_pct / 100) * 100, 500)
+                return any(abs(a - bucket) <= tol for a in aux_montos)
+
+            target  = abs(diferencia_saldos)
+            tol_dif = max(target * 0.05, 5000)   # 5 % del target, mín $5.000
+
+            # Buscar en el extracto movimientos no presentes en auxiliar
+            candidatos = []
+            for _, row in df_ext.iterrows():
+                for monto in [row.debito, row.credito]:
+                    if monto < 1000: continue
+                    if not _en_auxiliar(monto):
+                        candidatos.append({
+                            "fecha":       row.fecha,
+                            "descripcion": row.descripcion,
+                            "monto":       monto,
+                            "tipo":        "CARGO" if monto == row.debito else "ABONO",
+                            "dist_target": abs(monto - target),
+                        })
+
+            if not candidatos:
+                return None
+
+            candidatos.sort(key=lambda x: x["dist_target"])
+
+            # Si hay alguno dentro del 5 % del target, devolver el más cercano
+            cerca = [c for c in candidatos if c["dist_target"] <= tol_dif]
+            return cerca[0] if cerca else candidatos[0]
+
         # ── Excel output ──────────────────────────────────────────────────────
         _HDR  = PatternFill("solid", fgColor="1F3864")
         _YELL = PatternFill("solid", fgColor="FFF2CC")
@@ -915,6 +966,8 @@ if st.button("Generar conciliación", type="primary"):
             df_ext, df_inf, diferencia_saldos
         )
 
+        partida_faltante = _buscar_partida(df_ext, df_inf, diferencia_saldos)
+
         excel_buf, diferencia = build_excel(
             df_ext, df_inf, cheques, notas_cargo, notas_abono, ingresos,
             saldo_ext, saldo_cont, uploaded_ext.name,
@@ -938,13 +991,16 @@ if st.button("Generar conciliación", type="primary"):
     if diferencia == 0:
         st.success("✅ Conciliación completa — los saldos cuadran perfectamente.")
     else:
-        n_sin_ext = len(notas_cargo) + len(notas_abono)
-        n_sin_aux = len(cheques) + len(ingresos)
-        st.error(
-            f"⚠️ Diferencia de **${diferencia:,.0f}**  |  "
-            f"Extracto sin cruzar: {n_sin_ext} mov  |  Auxiliar sin cruzar: {n_sin_aux} mov  \n"
-            "Abre la hoja **Comparativo** del Excel para ver lado a lado qué no cuadra."
-        )
+        st.error(f"⚠️ Diferencia de **${diferencia:,.0f}**")
+
+        if partida_faltante:
+            st.warning(
+                f"**Posible partida faltante en el auxiliar:**\n\n"
+                f"- Fecha: {partida_faltante['fecha']}\n"
+                f"- Descripción: {partida_faltante['descripcion']}\n"
+                f"- Monto: **${partida_faltante['monto']:,.0f}** ({partida_faltante['tipo']})\n\n"
+                "Este movimiento aparece en el extracto bancario pero NO en el auxiliar contable."
+            )
 
     nombre_salida = uploaded_ext.name.replace(".pdf", "_conciliacion.xlsx")
     st.download_button(
