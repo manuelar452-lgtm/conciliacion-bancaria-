@@ -495,16 +495,13 @@ if st.button("Generar conciliación", type="primary"):
             return pd.DataFrame(rows) if rows else pd.DataFrame(
                 columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
 
-        def _parse_informe_fitz(lines, w, col_split=None):
+        def _parse_informe_fitz(lines, w, col_split=None, has_movimiento=False):
             """
-            Parsea el auxiliar contable: DÉBITOS | CRÉDITOS | SALDO.
-            col_split: posición X que divide la columna DÉBITO de la CRÉDITO.
-            Usa el borde derecho estimado (x0 + len*6.5) para clasificar correctamente
-            números grandes que tienen x0 muy a la izquierda por ser de muchos dígitos.
+            Parsea el auxiliar contable.
+            col_split: x0 del midpoint entre encabezados DÉBITOS y CRÉDITOS.
+            has_movimiento: True si existe columna MOVIMIENTO a la derecha del SALDO
+                            → el rightmost amount es MOVIMIENTO (ignorar), not SALDO.
             """
-            def _xr(x0, text):
-                return x0 + len(text) * 6.5
-
             rows = []
             for line in lines:
                 comprobante = next((t for _, t in line if _COMP_RE.match(t)), None)
@@ -514,35 +511,61 @@ if st.button("Generar conciliación", type="primary"):
                 try:    fecha = datetime.strptime(fecha_str, "%Y/%m/%d").date()
                 except: continue
 
-                # Recoger montos (zona derecha), usar x1 estimado para clasificar columnas
-                amounts = sorted(
-                    [(_xr(x, t), _to_float(t)) for x, t in line
-                     if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
-                     and x > w * 0.45],
-                    key=lambda a: a[0]
-                )
-                # x0 original del primer monto (para delimitar la descripción)
-                x0_primer = next((x for x, t in sorted(line)
-                                  if _is_amount(t) and x > w * 0.45), w)
-                if not amounts: continue
+                # Recoger montos: guardar (x0_original, valor)
+                raw_amounts = [
+                    (x, _to_float(t)) for x, t in line
+                    if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
+                    and x > w * 0.45
+                ]
+                raw_amounts.sort(key=lambda a: a[0])   # izq → der por x0 original
+                if not raw_amounts: continue
 
-                saldo = abs(amounts[-1][1])
+                x0_primer = raw_amounts[0][0]   # para delimitar la descripción
 
-                if len(amounts) >= 3:
-                    credito = abs(amounts[-2][1])
-                    debito  = abs(amounts[-3][1])
-                elif len(amounts) == 2:
-                    val   = abs(amounts[-2][1])
-                    xr_v  = amounts[-2][0]
-                    if col_split is not None:
-                        debito, credito = (val, 0.0) if xr_v < col_split else (0.0, val)
-                    else:
-                        # Sin info de encabezado: primera mitad del rango = DÉBITO
-                        xr_s = amounts[-1][0]
-                        mid  = (_xr(w * 0.45, "") + xr_s) / 2
-                        debito, credito = (val, 0.0) if xr_v < mid else (0.0, val)
+                # ── Identificar SALDO y montos de transacción ──────────────────
+                # Layout: DÉBITO | CRÉDITO | SALDO [| MOVIMIENTO]
+                # "0,00" nunca llega aquí (filtrado por abs()>0), así que solo
+                # vienen columnas con valor real.
+                # has_movimiento=True → rightmost = MOVIMIENTO (ignorar), second = SALDO
+                if has_movimiento:
+                    if len(raw_amounts) < 2: continue
+                    saldo = abs(raw_amounts[-2][1])
+                    txn   = raw_amounts[:-2]   # todo antes de SALDO y MOVIMIENTO
                 else:
-                    debito, credito = 0.0, 0.0
+                    saldo = abs(raw_amounts[-1][1])
+                    txn   = raw_amounts[:-1]   # todo antes de SALDO
+
+                if not txn: continue
+
+                # ── Clasificar transacción en DÉBITO / CRÉDITO ─────────────────
+                # Usamos x0 del monto (borde izquierdo real) vs col_split,
+                # que es el midpoint entre los x0 de los encabezados DÉBITOS/CRÉDITOS.
+                # Para montos right-aligned, x0 del monto < x0 del encabezado de su col;
+                # el midpoint entre las dos columnas sigue siendo un separador fiable.
+                if len(txn) == 1:
+                    x0_a, val_a = txn[0]
+                    val = abs(val_a)
+                    if col_split is not None:
+                        debito, credito = (val, 0.0) if x0_a < col_split else (0.0, val)
+                    else:
+                        # Sin info de encabezado: usar posición relativa
+                        x0_saldo = raw_amounts[-2][0] if has_movimiento else raw_amounts[-1][0]
+                        mid = (w * 0.45 + x0_saldo) / 2
+                        debito, credito = (val, 0.0) if x0_a < mid else (0.0, val)
+                else:
+                    # 2+ montos antes del SALDO: clasificar cada uno por posición
+                    debito  = 0.0
+                    credito = 0.0
+                    for x0_a, val_a in txn:
+                        if col_split is not None:
+                            if x0_a < col_split:
+                                debito  = max(debito,  abs(val_a))
+                            else:
+                                credito = max(credito, abs(val_a))
+                        else:
+                            debito = abs(txn[0][1])
+                            credito = abs(txn[-1][1])
+                            break
 
                 if debito == 0 and credito == 0: continue
 
@@ -600,6 +623,17 @@ if st.button("Generar conciliación", type="primary"):
                         lines, w = _ocr_page(page, dpi=300)
                         modo = "ocr"
 
+                    # Detectar encabezados de columna en las líneas ya procesadas
+                    # (funciona tanto para fitz como para OCR)
+                    if x0_deb is None or x0_cred is None:
+                        for lne in lines:
+                            for lx, lt in lne:
+                                ltu = lt.upper()
+                                if x0_deb is None and re.search(r'D[EÉ]BITO', ltu) and lx > w * 0.30:
+                                    x0_deb = lx
+                                if x0_cred is None and re.search(r'CR[EÉ]DITO', ltu) and lx > w * 0.30:
+                                    x0_cred = lx
+
                     if pg == 1:
                         aux_sample = [" | ".join(t for _, t in ln) for ln in lines[:8]]
                     all_pages.append((lines, w, modo))
@@ -613,18 +647,31 @@ if st.button("Generar conciliación", type="primary"):
                 return pd.DataFrame(
                     columns=["comprobante","fecha","descripcion","debito","credito","saldo"]), None
 
+            # Detectar si hay columna MOVIMIENTO buscando en todas las líneas
+            has_movimiento = False
+            if not has_movimiento:
+                for lines_pg, w_pg, _ in all_pages:
+                    for lne in lines_pg:
+                        for lx, lt in lne:
+                            if lt.upper() == "MOVIMIENTO" and lx > w_pg * 0.40:
+                                has_movimiento = True; break
+                        if has_movimiento: break
+                    if has_movimiento: break
+
+            # col_split: midpoint entre x0 de los encabezados (sin estimar ancho de carácter)
             col_split = None
             if x0_deb is not None and x0_cred is not None:
-                def _xr_h(x0, t): return x0 + len(t) * 6.5
-                col_split = (_xr_h(x0_deb, "DÉBITOS") + _xr_h(x0_cred, "CRÉDITOS")) / 2
+                col_split = (x0_deb + x0_cred) / 2
             st.session_state["col_split_debug"] = (
-                f"x0_deb={x0_deb} x0_cred={x0_cred} col_split={col_split}"
+                f"x0_deb={x0_deb} x0_cred={x0_cred} col_split={col_split} "
+                f"has_movimiento={has_movimiento}"
             )
 
             all_rows = []
             rows_per_page = []
             for pg_i, (lines, w, modo) in enumerate(all_pages, 1):
-                df_p = _parse_informe_fitz(lines, w, col_split=col_split)
+                df_p = _parse_informe_fitz(lines, w, col_split=col_split,
+                                           has_movimiento=has_movimiento)
                 rows_per_page.append((pg_i, len(df_p), modo))
                 if not df_p.empty:
                     all_rows.append(df_p)
