@@ -328,88 +328,130 @@ if st.button("Generar conciliación", type="primary"):
             )
 
         def _buscar_partida(df_ext, df_inf, diferencia_saldos):
+            """
+            Devuelve lista de partidas (greedy) que juntas explican la diferencia.
+            Busca en AMBAS direcciones:
+              - diferencia < 0 (aux > banco): créditos en aux sin retiro en banco
+                                             + débitos en banco sin registro en aux
+              - diferencia > 0 (banco > aux): depósitos en banco sin registro en aux
+                                             + débitos en aux sin depósito en banco
+            """
             from collections import defaultdict
 
             if df_ext.empty or df_inf.empty:
-                return None
+                return []
 
-            target  = abs(diferencia_saldos)
-            tol_dif = max(target * 0.15, 5_000)
+            target = abs(diferencia_saldos)
+            if target < 1_000:
+                return []
 
             def _key(v):
                 return round(v / 1_000) * 1_000
 
-            def _build_pool(df):
-                pool = defaultdict(int)
-                for _, r in df.iterrows():
-                    if r.debito  > 0: pool[_key(r.debito)]  += 1
-                    if r.credito > 0: pool[_key(r.credito)] += 1
-                return pool
+            def _pool_from(series):
+                p = defaultdict(int)
+                for v in series:
+                    if v > 0: p[_key(v)] += 1
+                return p
 
-            def _consume(pool, monto, tol_match=5_000):
-                m_key = _key(monto)
-                best_key, best_dist = None, float("inf")
+            def _consume(pool, monto, tol=5_000):
+                mk = _key(monto)
+                best_k, best_d = None, float("inf")
                 for k, cnt in pool.items():
-                    if cnt > 0:
-                        d = abs(k - m_key)
-                        if d <= tol_match and d < best_dist:
-                            best_dist, best_key = d, k
-                if best_key is not None:
-                    pool[best_key] -= 1
+                    if cnt > 0 and abs(k - mk) <= tol and abs(k - mk) < best_d:
+                        best_d, best_k = abs(k - mk), k
+                if best_k is not None:
+                    pool[best_k] -= 1
                     return True
                 return False
 
-            if diferencia_saldos < 0:
-                ext_c_pool = defaultdict(int)
-                for _, r in df_ext.iterrows():
-                    if r.credito > 0: ext_c_pool[_key(r.credito)] += 1
+            todos = []
 
-                candidatos = []
+            if diferencia_saldos < 0:
+                # aux > banco → buscar partidas que INFLAN saldo_cont o DEFLATAN saldo_ext
+                # A) créditos en aux (pagos asentados) sin retiro correspondiente en banco
+                ext_deb_pool = _pool_from(df_ext["debito"])
                 for _, row in df_inf.iterrows():
                     monto = row.credito
                     if monto < 1_000: continue
-                    if _consume(ext_c_pool, monto):
-                        pass
-                    else:
-                        dist = abs(monto - target)
-                        if dist <= tol_dif:
-                            desc = getattr(row, "descripcion", "")
-                            comp = getattr(row, "comprobante", "")
-                            candidatos.append({
-                                "origen":      "CRÉDITO en auxiliar sin respaldo en extracto bancario",
-                                "fecha":       row.fecha,
-                                "descripcion": f"{comp} {desc}".strip(),
-                                "monto":       monto,
-                                "tipo":        "CRÉDITO",
-                                "dist_target": dist,
-                            })
-            else:
-                aux_c_pool = defaultdict(int)
-                for _, r in df_inf.iterrows():
-                    if r.credito > 0: aux_c_pool[_key(r.credito)] += 1
-
-                candidatos = []
+                    if not _consume(ext_deb_pool, monto):
+                        todos.append({
+                            "origen": "Pago en auxiliar sin retiro en banco",
+                            "fecha": row.fecha,
+                            "descripcion": f"{row.comprobante} {row.descripcion}".strip(),
+                            "monto": monto, "tipo": "CRÉDITO aux",
+                        })
+                # B) depósitos en banco sin débito en aux (banco recibió algo no asentado)
+                aux_deb_pool = _pool_from(df_inf["debito"])
                 for _, row in df_ext.iterrows():
                     monto = row.credito
                     if monto < 1_000: continue
-                    if _consume(aux_c_pool, monto):
-                        pass
-                    else:
-                        dist = abs(monto - target)
-                        if dist <= tol_dif:
-                            candidatos.append({
-                                "origen":      "CRÉDITO en extracto bancario sin registrar en auxiliar",
-                                "fecha":       row.fecha,
-                                "descripcion": row.descripcion,
-                                "monto":       monto,
-                                "tipo":        "CRÉDITO",
-                                "dist_target": dist,
-                            })
+                    if not _consume(aux_deb_pool, monto):
+                        todos.append({
+                            "origen": "Depósito en banco sin registro en auxiliar",
+                            "fecha": row.fecha,
+                            "descripcion": row.descripcion,
+                            "monto": monto, "tipo": "CRÉDITO banco",
+                        })
+            else:
+                # banco > aux → buscar partidas que INFLAN saldo_ext o DEFLATAN saldo_cont
+                # A) depósitos en banco sin débito en aux
+                aux_deb_pool = _pool_from(df_inf["debito"])
+                for _, row in df_ext.iterrows():
+                    monto = row.credito
+                    if monto < 1_000: continue
+                    if not _consume(aux_deb_pool, monto):
+                        todos.append({
+                            "origen": "Depósito en banco sin registro en auxiliar",
+                            "fecha": row.fecha,
+                            "descripcion": row.descripcion,
+                            "monto": monto, "tipo": "CRÉDITO banco",
+                        })
+                # B) créditos en aux sin retiro en banco
+                ext_deb_pool = _pool_from(df_ext["debito"])
+                for _, row in df_inf.iterrows():
+                    monto = row.credito
+                    if monto < 1_000: continue
+                    if not _consume(ext_deb_pool, monto):
+                        todos.append({
+                            "origen": "Pago en auxiliar sin retiro en banco",
+                            "fecha": row.fecha,
+                            "descripcion": f"{row.comprobante} {row.descripcion}".strip(),
+                            "monto": monto, "tipo": "CRÉDITO aux",
+                        })
 
-            if not candidatos:
-                return None
-            candidatos.sort(key=lambda x: x["dist_target"])
-            return candidatos[0]
+            if not todos:
+                return []
+
+            # ── Greedy: seleccionar las que juntas cubren la diferencia ──────
+            todos.sort(key=lambda x: x["monto"], reverse=True)
+            seleccionadas = []
+            restante = target
+            pool_greedy = list(todos)
+
+            while restante > target * 0.005 and pool_greedy:
+                # Elegir la entrada cuyo monto esté más cerca del restante
+                candidatas = [c for c in pool_greedy if c["monto"] <= restante * 1.5]
+                if not candidatas:
+                    break
+                mejor = min(candidatas, key=lambda x: abs(x["monto"] - restante))
+                seleccionadas.append(mejor)
+                restante -= mejor["monto"]
+                pool_greedy.remove(mejor)
+                if len(seleccionadas) >= 15:
+                    break
+
+            if not seleccionadas:
+                return []
+
+            acum = 0
+            for c in seleccionadas:
+                acum += c["monto"]
+                c["acumulado"] = acum
+                c["restante"]  = max(0.0, target - acum)
+                c["cobertura"] = round(acum / target * 100, 1) if target else 0
+
+            return seleccionadas
 
         # ── Excel output ──────────────────────────────────────────────────────
         _HDR  = PatternFill("solid", fgColor="1F3864")
@@ -459,15 +501,15 @@ if st.button("Generar conciliación", type="primary"):
                 cell.border    = _BRD
                 cell.alignment = Alignment(vertical="center")
 
-        def build_excel(df_ext, df_inf, saldo_ext, saldo_cont, nombre_arch, partida_faltante):
+        def build_excel(df_ext, df_inf, saldo_ext, saldo_cont, nombre_arch, partidas):
             wb = Workbook()
             ws = wb.active; ws.title = "Conciliacion"
-            for col, cw in zip("AB", [38, 26]):
+            for col, cw in zip("ABCDE", [14, 40, 22, 22, 22]):
                 ws.column_dimensions[col].width = cw
 
             diferencia = round((saldo_ext or 0) - (saldo_cont or 0), 2)
 
-            ws.merge_cells("A1:B1")
+            ws.merge_cells("A1:E1")
             c = ws["A1"]
             c.value     = "CONCILIACIÓN BANCARIA"
             c.font      = Font(bold=True, size=14, color="FFFFFF")
@@ -475,7 +517,7 @@ if st.button("Generar conciliación", type="primary"):
             c.alignment = Alignment(horizontal="center", vertical="center")
             ws.row_dimensions[1].height = 30
 
-            ws.merge_cells("A2:B2")
+            ws.merge_cells("A2:E2")
             c2       = ws["A2"]
             c2.value = f"{nombre_arch}   |   {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             c2.font  = Font(size=9, color="666666")
@@ -487,19 +529,33 @@ if st.button("Generar conciliación", type="primary"):
             _kv(ws, 6, "DIFERENCIA",               _fmt_cop(diferencia),
                 _GRN if diferencia == 0 else _RED)
 
-            if partida_faltante:
-                ws.merge_cells("A8:B8")
-                lbl       = ws["A8"]
-                lbl.value = "PARTIDA FALTANTE IDENTIFICADA"
+            next_row = 8
+            if partidas:
+                total_cubierto = sum(p["monto"] for p in partidas)
+                pct = round(total_cubierto / abs(diferencia) * 100, 1) if diferencia else 0
+
+                ws.merge_cells(f"A{next_row}:E{next_row}")
+                lbl       = ws[f"A{next_row}"]
+                lbl.value = f"PARTIDAS EN CONCILIACIÓN  —  cubre {pct}% de la diferencia"
                 lbl.font  = Font(bold=True, size=11, color="7F4F00")
                 lbl.fill  = _YELL
                 lbl.alignment = Alignment(horizontal="center", vertical="center")
-                ws.row_dimensions[8].height = 22
-                _kv(ws, 9,  "Fecha",       str(partida_faltante["fecha"]),       _YELL)
-                _kv(ws, 10, "Descripción", partida_faltante["descripcion"],      _YELL)
-                _kv(ws, 11, "Monto",       _fmt_cop(partida_faltante["monto"]),  _YELL)
-                _kv(ws, 12, "Tipo",        partida_faltante["tipo"],             _YELL)
-                _kv(ws, 13, "Origen",      partida_faltante["origen"],           _YELL)
+                ws.row_dimensions[next_row].height = 22
+                next_row += 1
+
+                _hrow(ws, next_row,
+                      ["Fecha", "Descripción / Origen", "Monto", "Acumulado", "Restante"])
+                next_row += 1
+
+                for p in partidas:
+                    _drow(ws, next_row,
+                          [str(p["fecha"]),
+                           f"{p['descripcion']}  [{p['origen']}]",
+                           _fmt_cop(p["monto"]),
+                           _fmt_cop(p["acumulado"]),
+                           _fmt_cop(p["restante"])],
+                          _YELL)
+                    next_row += 1
 
             ws2 = wb.create_sheet("Extracto")
             for col, cw in zip("ABCDEF", [12, 8, 45, 22, 22, 26]):
@@ -546,11 +602,11 @@ if st.button("Generar conciliación", type="primary"):
         saldo_cont  = float(_inf_saldos.iloc[-1]) if not _inf_saldos.empty else None
 
         diferencia_saldos = round((saldo_ext or 0) - (saldo_cont or 0), 2)
-        partida_faltante  = _buscar_partida(df_ext, df_inf, diferencia_saldos)
+        partidas          = _buscar_partida(df_ext, df_inf, diferencia_saldos)
 
         excel_buf, diferencia = build_excel(
             df_ext, df_inf, saldo_ext, saldo_cont,
-            uploaded_ext.name, partida_faltante,
+            uploaded_ext.name, partidas,
         )
 
     # ── Resultado ─────────────────────────────────────────────────────────────
@@ -569,13 +625,36 @@ if st.button("Generar conciliación", type="primary"):
     else:
         st.error(f"⚠️ Diferencia de **${diferencia:,.0f}**")
 
-        if partida_faltante:
-            origen = partida_faltante["origen"]
+        if partidas:
+            total_cubierto = sum(p["monto"] for p in partidas)
+            pct = round(total_cubierto / abs(diferencia) * 100, 1) if diferencia else 0
+            restante_total = abs(diferencia) - total_cubierto
+
             st.warning(
-                f"**Posible partida faltante — {origen}:**\n\n"
-                f"- Fecha: {partida_faltante['fecha']}\n"
-                f"- Descripción: {partida_faltante['descripcion']}\n"
-                f"- Monto: **${partida_faltante['monto']:,.0f}** ({partida_faltante['tipo']})"
+                f"**Partidas en conciliación encontradas: {len(partidas)}**  —  "
+                f"cubren **{pct}%** de la diferencia  "
+                f"(acumulado **${total_cubierto:,.0f}** | sin explicar: **${restante_total:,.0f}**)"
+            )
+
+            df_partidas = pd.DataFrame([{
+                "Fecha":        p["fecha"],
+                "Descripción":  p["descripcion"],
+                "Origen":       p["origen"],
+                "Monto":        p["monto"],
+                "Acumulado":    p["acumulado"],
+                "Restante":     p["restante"],
+                "Cobertura %":  p["cobertura"],
+            } for p in partidas])
+
+            st.dataframe(
+                df_partidas.style.format({
+                    "Monto":       "${:,.0f}",
+                    "Acumulado":   "${:,.0f}",
+                    "Restante":    "${:,.0f}",
+                    "Cobertura %": "{:.1f}%",
+                }),
+                use_container_width=True,
+                hide_index=True,
             )
 
     nombre_salida = re.sub(r"\.(xlsx|xls)$", "", uploaded_ext.name,
