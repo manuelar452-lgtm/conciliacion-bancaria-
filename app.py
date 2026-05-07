@@ -839,12 +839,15 @@ if st.button("Generar conciliación", type="primary"):
             ext_sin.sort(key=lambda x: str(x["fecha"]))
 
             # Datos lado auxiliar (débitos y créditos sin cruzar)
+            # ingresos tiene "descripcion"; cheques tiene "beneficiario"
             aux_sin = (
                 [{"comp": r["comprobante"], "fecha": r["fecha"],
-                  "desc": r["descripcion"], "monto": _fmt_cop(r["monto"])}
+                  "desc": r.get("descripcion", r.get("beneficiario", "")),
+                  "monto": _fmt_cop(r["monto"])}
                  for r in ingresos.to_dict("records")] +
                 [{"comp": r["comprobante"], "fecha": r["fecha"],
-                  "desc": r["descripcion"], "monto": f'-{_fmt_cop(r["monto"])}'}
+                  "desc": r.get("beneficiario", r.get("descripcion", "")),
+                  "monto": f'-{_fmt_cop(r["monto"])}'}
                  for r in cheques.to_dict("records")]
             )
             aux_sin.sort(key=lambda x: str(x["fecha"]))
