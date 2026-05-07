@@ -468,9 +468,13 @@ if st.button("Generar conciliación", type="primary"):
                 columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
 
         def _parse_informe_fitz(lines, w):
-            """Parsea líneas del auxiliar extraídas por fitz."""
+            """
+            Parsea el auxiliar contable que tiene 3 columnas numéricas:
+            DÉBITOS | CRÉDITOS | SALDO  (de izquierda a derecha en la zona derecha).
+            El saldo es siempre el más a la derecha; el anterior es CRÉDITO; el
+            anterior a ese es DÉBITO (si existe).
+            """
             rows = []
-            prev_saldo = None
             for line in lines:
                 comprobante = next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None)
                 if not comprobante: continue
@@ -478,29 +482,30 @@ if st.button("Generar conciliación", type="primary"):
                 if not fecha_str: continue
                 try:    fecha = datetime.strptime(fecha_str, "%Y/%m/%d").date()
                 except: continue
+
+                # Recoger todos los montos en la mitad derecha, ordenados por X
                 amounts = sorted(
-                    [(x, _parse_num(t)) for x, t in line
-                     if _is_currency(t) and _parse_num(t) and _parse_num(t) > 0
-                     and x > w * 0.50],
+                    [(x, _to_float(t)) for x, t in line
+                     if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
+                     and x > w * 0.45],
                     key=lambda a: a[0]
                 )
                 if not amounts: continue
-                saldo = amounts[-1][1]
-                non_saldo = [v for _, v in amounts[:-1]]
-                if not non_saldo: continue
-                amount = non_saldo[-1]
-                if prev_saldo is not None:
-                    debito, credito = (amount, 0.0) if saldo >= prev_saldo else (0.0, amount)
-                else:
-                    x_amt = amounts[-2][0] if len(amounts) >= 2 else 0
-                    debito, credito = (amount, 0.0) if x_amt < w * 0.68 else (0.0, amount)
-                prev_saldo = saldo
-                fecha_x = next((x for x, t in line if t == fecha_str), 0)
-                monto_x  = amounts[-2][0] if len(amounts) >= 2 else w
+
+                # Rightmost = SALDO; el anterior = CRÉDITOS; el anterior = DÉBITOS
+                saldo   = abs(amounts[-1][1])
+                credito = abs(amounts[-2][1]) if len(amounts) >= 2 else 0.0
+                debito  = abs(amounts[-3][1]) if len(amounts) >= 3 else 0.0
+
+                if debito == 0 and credito == 0: continue
+
+                fecha_x   = next((x for x, t in line if t == fecha_str), 0)
+                primer_monto_x = amounts[0][0]
                 desc = " ".join(t for x, t in sorted(line)
-                    if x > fecha_x and x < monto_x
+                    if x > fecha_x and x < primer_monto_x - w * 0.01
                     and not re.match(r"^[\d,\.]+$", t)
                     and t not in ("O", "0", "SUC", "NIT")).strip()
+
                 rows.append({"comprobante": comprobante, "fecha": fecha, "descripcion": desc,
                              "debito": debito, "credito": credito, "saldo": saldo})
             return pd.DataFrame(rows) if rows else pd.DataFrame(
