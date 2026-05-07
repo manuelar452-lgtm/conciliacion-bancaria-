@@ -469,11 +469,42 @@ if st.button("Generar conciliación", type="primary"):
 
         def _parse_informe_fitz(lines, w):
             """
-            Parsea el auxiliar contable que tiene 3 columnas numéricas:
-            DÉBITOS | CRÉDITOS | SALDO  (de izquierda a derecha en la zona derecha).
-            El saldo es siempre el más a la derecha; el anterior es CRÉDITO; el
-            anterior a ese es DÉBITO (si existe).
+            Parsea el auxiliar contable: DÉBITOS | CRÉDITOS | SALDO.
+            Usa dos pasadas:
+              1) Recolecta todas las posiciones X de montos de transacción para
+                 encontrar el límite natural entre la columna DÉBITO y CRÉDITO.
+              2) Clasifica cada fila usando ese límite.
             """
+            # ── Pasada 1: descubrir el límite X entre DÉBITO y CRÉDITO ────────
+            trans_xs = []
+            for line in lines:
+                if not next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None):
+                    continue
+                amts = sorted(
+                    [(x, abs(_to_float(t) or 0)) for x, t in line
+                     if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
+                     and x > w * 0.45],
+                    key=lambda a: a[0]
+                )
+                # Todo excepto el más a la derecha (= SALDO) es monto de transacción
+                for x_a, _ in amts[:-1]:
+                    trans_xs.append(x_a)
+
+            # Buscar el mayor salto entre posiciones X consecutivas (en bins de 2 pt)
+            x_col_split = None
+            if len(trans_xs) >= 4:
+                binned = sorted(set(round(x / 2) * 2 for x in trans_xs))
+                if len(binned) >= 2:
+                    max_gap, best_mid = 0, None
+                    for i in range(len(binned) - 1):
+                        g = binned[i + 1] - binned[i]
+                        if g > max_gap:
+                            max_gap = g
+                            best_mid = (binned[i] + binned[i + 1]) / 2
+                    if max_gap >= 8:          # salto real entre columnas (> 8 pt)
+                        x_col_split = best_mid
+
+            # ── Pasada 2: parsear filas ───────────────────────────────────────
             rows = []
             for line in lines:
                 comprobante = next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None)
@@ -483,7 +514,6 @@ if st.button("Generar conciliación", type="primary"):
                 try:    fecha = datetime.strptime(fecha_str, "%Y/%m/%d").date()
                 except: continue
 
-                # Recoger todos los montos en la mitad derecha, ordenados por X
                 amounts = sorted(
                     [(x, _to_float(t)) for x, t in line
                      if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
@@ -492,30 +522,29 @@ if st.button("Generar conciliación", type="primary"):
                 )
                 if not amounts: continue
 
-                # Rightmost = SALDO; los anteriores = DÉBITOS | CRÉDITOS según posición X.
-                # Con 3+ montos el orden posicional ya distingue las columnas.
-                # Con exactamente 2 montos usamos el gap X entre el monto y el SALDO:
-                #   gap grande (> 20 % del ancho) → monto está en columna DÉBITO (más a la izq.)
-                #   gap pequeño                   → monto está en columna CRÉDITO (adyacente al SALDO)
-                saldo = abs(amounts[-1][1])
+                saldo   = abs(amounts[-1][1])
                 x_saldo = amounts[-1][0]
 
                 if len(amounts) >= 3:
+                    # Tres montos: posición ya distingue débito / crédito
                     credito = abs(amounts[-2][1])
                     debito  = abs(amounts[-3][1])
                 elif len(amounts) == 2:
-                    val    = abs(amounts[-2][1])
-                    x_val  = amounts[-2][0]
-                    if (x_saldo - x_val) > w * 0.20:
-                        debito, credito = val, 0.0   # columna DÉBITO (más alejada del SALDO)
+                    val   = abs(amounts[-2][1])
+                    x_val = amounts[-2][0]
+                    if x_col_split is not None:
+                        # Usar límite calibrado
+                        debito, credito = (val, 0.0) if x_val < x_col_split else (0.0, val)
                     else:
-                        debito, credito = 0.0, val   # columna CRÉDITO (junto al SALDO)
+                        # Sin calibración: primera mitad del rango de montos = DÉBITO
+                        mid = w * 0.45 + (x_saldo - w * 0.45) / 2.0
+                        debito, credito = (val, 0.0) if x_val < mid else (0.0, val)
                 else:
                     debito, credito = 0.0, 0.0
 
                 if debito == 0 and credito == 0: continue
 
-                fecha_x   = next((x for x, t in line if t == fecha_str), 0)
+                fecha_x        = next((x for x, t in line if t == fecha_str), 0)
                 primer_monto_x = amounts[0][0]
                 desc = " ".join(t for x, t in sorted(line)
                     if x > fecha_x and x < primer_monto_x - w * 0.01
