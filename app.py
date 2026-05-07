@@ -266,11 +266,11 @@ if st.button("Generar conciliación", type="primary"):
             return None
 
         def _find_saldo_fitz(pdf_path: str) -> float | None:
-            """OCR las últimas páginas del PDF para encontrar el Saldo Final."""
+            """OCR todas las páginas del PDF para encontrar el Saldo Final."""
             try:
                 doc = fitz.open(pdf_path)
                 n_pages = len(doc)
-                for pg_idx in range(n_pages - 1, max(n_pages - 4, -1), -1):
+                for pg_idx in range(n_pages):
                     page = doc[pg_idx]
                     img  = _fitz_render_page(page, dpi=200)
                     text = pytesseract.image_to_string(img, config="--psm 6")
