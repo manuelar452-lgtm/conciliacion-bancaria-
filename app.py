@@ -470,30 +470,32 @@ if st.button("Generar conciliación", type="primary"):
         def _parse_informe_fitz(lines, w):
             """
             Parsea el auxiliar contable: DÉBITOS | CRÉDITOS | SALDO.
-            Usa dos pasadas:
-              1) Recolecta todas las posiciones X de montos de transacción para
-                 encontrar el límite natural entre la columna DÉBITO y CRÉDITO.
-              2) Clasifica cada fila usando ese límite.
+            Los números están justificados a la derecha → usamos el borde DERECHO
+            estimado (x0 + len(texto)*6.5) en vez del borde izquierdo (x0) para que
+            todos los montos de la misma columna caigan en la misma posición X.
+            Dos pasadas: 1) calibrar límite DÉBITO/CRÉDITO, 2) parsear filas.
             """
-            # ── Pasada 1: descubrir el límite X entre DÉBITO y CRÉDITO ────────
-            trans_xs = []
+            def _xr(x0, text):
+                """Borde derecho estimado de un token numérico (justificado derecha)."""
+                return x0 + len(text) * 6.5
+
+            # ── Pasada 1: calibrar límite entre DÉBITO y CRÉDITO ─────────────
+            trans_xr = []
             for line in lines:
                 if not next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None):
                     continue
                 amts = sorted(
-                    [(x, abs(_to_float(t) or 0)) for x, t in line
+                    [(_xr(x, t), abs(_to_float(t) or 0)) for x, t in line
                      if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
                      and x > w * 0.45],
                     key=lambda a: a[0]
                 )
-                # Todo excepto el más a la derecha (= SALDO) es monto de transacción
-                for x_a, _ in amts[:-1]:
-                    trans_xs.append(x_a)
+                for xr_a, _ in amts[:-1]:   # excluir SALDO (último = más a la derecha)
+                    trans_xr.append(xr_a)
 
-            # Buscar el mayor salto entre posiciones X consecutivas (en bins de 2 pt)
             x_col_split = None
-            if len(trans_xs) >= 4:
-                binned = sorted(set(round(x / 2) * 2 for x in trans_xs))
+            if len(trans_xr) >= 4:
+                binned = sorted(set(round(x / 3) * 3 for x in trans_xr))
                 if len(binned) >= 2:
                     max_gap, best_mid = 0, None
                     for i in range(len(binned) - 1):
@@ -501,7 +503,7 @@ if st.button("Generar conciliación", type="primary"):
                         if g > max_gap:
                             max_gap = g
                             best_mid = (binned[i] + binned[i + 1]) / 2
-                    if max_gap >= 8:          # salto real entre columnas (> 8 pt)
+                    if max_gap >= 6:
                         x_col_split = best_mid
 
             # ── Pasada 2: parsear filas ───────────────────────────────────────
@@ -514,38 +516,43 @@ if st.button("Generar conciliación", type="primary"):
                 try:    fecha = datetime.strptime(fecha_str, "%Y/%m/%d").date()
                 except: continue
 
-                amounts = sorted(
+                # Clasificar usando borde derecho estimado
+                amounts_xr = sorted(
+                    [(_xr(x, t), _to_float(t)) for x, t in line
+                     if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
+                     and x > w * 0.45],
+                    key=lambda a: a[0]
+                )
+                # También necesitamos el x0 original del primer monto para delimitar descripción
+                amounts_x0 = sorted(
                     [(x, _to_float(t)) for x, t in line
                      if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
                      and x > w * 0.45],
                     key=lambda a: a[0]
                 )
-                if not amounts: continue
+                if not amounts_xr: continue
 
-                saldo   = abs(amounts[-1][1])
-                x_saldo = amounts[-1][0]
+                saldo    = abs(amounts_xr[-1][1])
+                xr_saldo = amounts_xr[-1][0]
 
-                if len(amounts) >= 3:
-                    # Tres montos: posición ya distingue débito / crédito
-                    credito = abs(amounts[-2][1])
-                    debito  = abs(amounts[-3][1])
-                elif len(amounts) == 2:
-                    val   = abs(amounts[-2][1])
-                    x_val = amounts[-2][0]
+                if len(amounts_xr) >= 3:
+                    credito = abs(amounts_xr[-2][1])
+                    debito  = abs(amounts_xr[-3][1])
+                elif len(amounts_xr) == 2:
+                    val    = abs(amounts_xr[-2][1])
+                    xr_val = amounts_xr[-2][0]
                     if x_col_split is not None:
-                        # Usar límite calibrado
-                        debito, credito = (val, 0.0) if x_val < x_col_split else (0.0, val)
+                        debito, credito = (val, 0.0) if xr_val < x_col_split else (0.0, val)
                     else:
-                        # Sin calibración: primera mitad del rango de montos = DÉBITO
-                        mid = w * 0.45 + (x_saldo - w * 0.45) / 2.0
-                        debito, credito = (val, 0.0) if x_val < mid else (0.0, val)
+                        mid = (w * 0.45 * 6.5 + xr_saldo) / 2.0
+                        debito, credito = (val, 0.0) if xr_val < mid else (0.0, val)
                 else:
                     debito, credito = 0.0, 0.0
 
                 if debito == 0 and credito == 0: continue
 
                 fecha_x        = next((x for x, t in line if t == fecha_str), 0)
-                primer_monto_x = amounts[0][0]
+                primer_monto_x = amounts_x0[0][0] if amounts_x0 else 0
                 desc = " ".join(t for x, t in sorted(line)
                     if x > fecha_x and x < primer_monto_x - w * 0.01
                     and not re.match(r"^[\d,\.]+$", t)
