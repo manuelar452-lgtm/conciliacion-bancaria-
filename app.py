@@ -467,44 +467,43 @@ if st.button("Generar conciliación", type="primary"):
             return pd.DataFrame(rows) if rows else pd.DataFrame(
                 columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
 
-        def _parse_informe_fitz(lines, w):
+        def _parse_informe_fitz(lines, w, x_col_split_override=None):
             """
             Parsea el auxiliar contable: DÉBITOS | CRÉDITOS | SALDO.
-            Los números están justificados a la derecha → usamos el borde DERECHO
-            estimado (x0 + len(texto)*6.5) en vez del borde izquierdo (x0) para que
-            todos los montos de la misma columna caigan en la misma posición X.
-            Dos pasadas: 1) calibrar límite DÉBITO/CRÉDITO, 2) parsear filas.
+            x_col_split_override: límite calibrado externamente (recomendado usarlo
+            cuando se tiene data de todas las páginas del documento).
             """
             def _xr(x0, text):
-                """Borde derecho estimado de un token numérico (justificado derecha)."""
                 return x0 + len(text) * 6.5
 
-            # ── Pasada 1: calibrar límite entre DÉBITO y CRÉDITO ─────────────
-            trans_xr = []
-            for line in lines:
-                if not next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None):
-                    continue
-                amts = sorted(
-                    [(_xr(x, t), abs(_to_float(t) or 0)) for x, t in line
-                     if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
-                     and x > w * 0.45],
-                    key=lambda a: a[0]
-                )
-                for xr_a, _ in amts[:-1]:   # excluir SALDO (último = más a la derecha)
-                    trans_xr.append(xr_a)
-
-            x_col_split = None
-            if len(trans_xr) >= 4:
-                binned = sorted(set(round(x / 3) * 3 for x in trans_xr))
-                if len(binned) >= 2:
-                    max_gap, best_mid = 0, None
-                    for i in range(len(binned) - 1):
-                        g = binned[i + 1] - binned[i]
-                        if g > max_gap:
-                            max_gap = g
-                            best_mid = (binned[i] + binned[i + 1]) / 2
-                    if max_gap >= 6:
-                        x_col_split = best_mid
+            # Si no se pasa override, calibrar localmente con las líneas disponibles
+            if x_col_split_override is not None:
+                x_col_split = x_col_split_override
+            else:
+                trans_xr = []
+                for line in lines:
+                    if not next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None):
+                        continue
+                    amts = sorted(
+                        [(_xr(x, t), abs(_to_float(t) or 0)) for x, t in line
+                         if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
+                         and x > w * 0.35],
+                        key=lambda a: a[0]
+                    )
+                    for xr_a, _ in amts[:-1]:
+                        trans_xr.append(xr_a)
+                x_col_split = None
+                if len(trans_xr) >= 4:
+                    binned = sorted(set(round(x / 3) * 3 for x in trans_xr))
+                    if len(binned) >= 2:
+                        max_gap, best_mid = 0, None
+                        for i in range(len(binned) - 1):
+                            g = binned[i + 1] - binned[i]
+                            if g > max_gap:
+                                max_gap = g
+                                best_mid = (binned[i] + binned[i + 1]) / 2
+                        if max_gap >= 6:
+                            x_col_split = best_mid
 
             # ── Pasada 2: parsear filas ───────────────────────────────────────
             rows = []
@@ -520,14 +519,14 @@ if st.button("Generar conciliación", type="primary"):
                 amounts_xr = sorted(
                     [(_xr(x, t), _to_float(t)) for x, t in line
                      if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
-                     and x > w * 0.45],
+                     and x > w * 0.35],
                     key=lambda a: a[0]
                 )
                 # También necesitamos el x0 original del primer monto para delimitar descripción
                 amounts_x0 = sorted(
                     [(x, _to_float(t)) for x, t in line
                      if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
-                     and x > w * 0.45],
+                     and x > w * 0.35],
                     key=lambda a: a[0]
                 )
                 if not amounts_xr: continue
@@ -564,8 +563,11 @@ if st.button("Generar conciliación", type="primary"):
                 columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
 
         def parse_auxiliar():
-            """Procesa auxiliar con PyMuPDF (sin binarios del sistema)."""
-            all_rows = []
+            """Procesa auxiliar con PyMuPDF.
+            Acumula líneas de TODAS las páginas antes de calibrar columnas,
+            para que el split DÉBITO/CRÉDITO use toda la distribución del documento.
+            """
+            all_lines = []   # (lines, w) por página
             aux_sample = []
             try:
                 doc = fitz.open(pdf_aux_path)
@@ -574,25 +576,70 @@ if st.button("Generar conciliación", type="primary"):
                     if words:
                         w = page.rect.width
                         lines, cur, cur_y = [], [], None
-                        for x0,y0,x1,y1,word,*_ in sorted(words, key=lambda r:(round(r[1],1),r[0])):
-                            if cur_y is None or abs(y0-cur_y)<=4:
-                                cur.append((x0,word)); cur_y = cur_y or y0
+                        for x0,y0,x1,y1,word,*_ in sorted(words,
+                                key=lambda r: (round(r[1], 1), r[0])):
+                            # tolerancia 8 pt: cubre ligeras variaciones de baseline
+                            if cur_y is None or abs(y0 - cur_y) <= 8:
+                                cur.append((x0, word))
+                                if cur_y is None: cur_y = y0
                             else:
                                 if cur: lines.append(sorted(cur))
-                                cur, cur_y = [(x0,word)], y0
+                                cur, cur_y = [(x0, word)], y0
                         if cur: lines.append(sorted(cur))
                     else:
                         lines, w = _ocr_page(page, dpi=200)
                     if pg == 1:
                         aux_sample = [" | ".join(t for _, t in ln) for ln in lines[:8]]
-                    df_p = _parse_informe_fitz(lines, w)
-                    if not df_p.empty:
-                        all_rows.append(df_p)
+                    all_lines.append((lines, w))
                 doc.close()
             except Exception as e:
                 aux_sample = [f"ERROR: {e}"]
 
             st.session_state["aux_sample"] = aux_sample
+            if not all_lines:
+                return pd.DataFrame(
+                    columns=["comprobante","fecha","descripcion","debito","credito","saldo"]), None
+
+            # Usar el ancho de la primera página como referencia
+            w_ref = all_lines[0][1]
+
+            # Calibración global: recolectar posiciones X de transacciones en TODAS las páginas
+            trans_xr_all = []
+            def _xr(x0, text): return x0 + len(text) * 6.5
+            for lines, w in all_lines:
+                for line in lines:
+                    if not next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None):
+                        continue
+                    amts = sorted(
+                        [(_xr(x, t), abs(_to_float(t) or 0)) for x, t in line
+                         if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
+                         and x > w * 0.35],
+                        key=lambda a: a[0]
+                    )
+                    for xr_a, _ in amts[:-1]:
+                        trans_xr_all.append(xr_a)
+
+            x_col_split_global = None
+            if len(trans_xr_all) >= 4:
+                binned = sorted(set(round(x / 3) * 3 for x in trans_xr_all))
+                if len(binned) >= 2:
+                    max_gap, best_mid = 0, None
+                    for i in range(len(binned) - 1):
+                        g = binned[i + 1] - binned[i]
+                        if g > max_gap:
+                            max_gap = g
+                            best_mid = (binned[i] + binned[i + 1]) / 2
+                    if max_gap >= 6:
+                        x_col_split_global = best_mid
+
+            # Parsear todas las páginas usando el split calibrado
+            all_rows = []
+            for lines, w in all_lines:
+                df_p = _parse_informe_fitz(lines, w,
+                                           x_col_split_override=x_col_split_global)
+                if not df_p.empty:
+                    all_rows.append(df_p)
+
             if not all_rows:
                 return pd.DataFrame(
                     columns=["comprobante","fecha","descripcion","debito","credito","saldo"]), None
