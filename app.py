@@ -492,10 +492,26 @@ if st.button("Generar conciliación", type="primary"):
                 )
                 if not amounts: continue
 
-                # Rightmost = SALDO; el anterior = CRÉDITOS; el anterior = DÉBITOS
-                saldo   = abs(amounts[-1][1])
-                credito = abs(amounts[-2][1]) if len(amounts) >= 2 else 0.0
-                debito  = abs(amounts[-3][1]) if len(amounts) >= 3 else 0.0
+                # Rightmost = SALDO; los anteriores = DÉBITOS | CRÉDITOS según posición X.
+                # Con 3+ montos el orden posicional ya distingue las columnas.
+                # Con exactamente 2 montos usamos el gap X entre el monto y el SALDO:
+                #   gap grande (> 20 % del ancho) → monto está en columna DÉBITO (más a la izq.)
+                #   gap pequeño                   → monto está en columna CRÉDITO (adyacente al SALDO)
+                saldo = abs(amounts[-1][1])
+                x_saldo = amounts[-1][0]
+
+                if len(amounts) >= 3:
+                    credito = abs(amounts[-2][1])
+                    debito  = abs(amounts[-3][1])
+                elif len(amounts) == 2:
+                    val    = abs(amounts[-2][1])
+                    x_val  = amounts[-2][0]
+                    if (x_saldo - x_val) > w * 0.20:
+                        debito, credito = val, 0.0   # columna DÉBITO (más alejada del SALDO)
+                    else:
+                        debito, credito = 0.0, val   # columna CRÉDITO (junto al SALDO)
+                else:
+                    debito, credito = 0.0, 0.0
 
                 if debito == 0 and credito == 0: continue
 
