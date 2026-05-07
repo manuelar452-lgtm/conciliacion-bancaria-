@@ -618,34 +618,41 @@ if st.button("Generar conciliación", type="primary"):
 
         def _buscar_partida(df_ext, df_inf, diferencia_saldos):
             """
-            Compara los montos del extracto contra los del auxiliar (sin depender
-            de fechas).  Devuelve el movimiento del extracto cuyo monto no aparece
-            en el auxiliar y es el más cercano a la diferencia de saldos.
+            Busca en AMBAS direcciones (extracto vs auxiliar y auxiliar vs extracto)
+            el movimiento cuyo monto es más cercano a la diferencia de saldos y
+            no tiene contraparte en el otro documento.
             """
             if df_ext.empty or df_inf.empty:
                 return None
 
-            # Multiset de montos del auxiliar redondeados a $100
-            aux_montos = []
-            for _, r in df_inf.iterrows():
-                if r.debito  > 0: aux_montos.append(round(r.debito  / 100) * 100)
-                if r.credito > 0: aux_montos.append(round(r.credito / 100) * 100)
-
-            def _en_auxiliar(monto, tol_pct=0.02):
-                bucket = round(monto / 100) * 100
-                tol    = max(round(monto * tol_pct / 100) * 100, 500)
-                return any(abs(a - bucket) <= tol for a in aux_montos)
-
             target  = abs(diferencia_saldos)
-            tol_dif = max(target * 0.05, 5000)   # 5 % del target, mín $5.000
+            # Tolerancia amplia: hasta 30 % del target o mín $10.000
+            tol_dif = max(target * 0.30, 10_000)
 
-            # Buscar en el extracto movimientos no presentes en auxiliar
+            def _montos(df):
+                out = []
+                for _, r in df.iterrows():
+                    if r.debito  > 0: out.append(round(r.debito  / 100) * 100)
+                    if r.credito > 0: out.append(round(r.credito / 100) * 100)
+                return out
+
+            ext_montos = _montos(df_ext)
+            aux_montos = _montos(df_inf)
+
+            def _tiene_par(monto, lista, tol_pct=0.02):
+                tol = max(round(monto * tol_pct / 100) * 100, 1000)
+                bucket = round(monto / 100) * 100
+                return any(abs(a - bucket) <= tol for a in lista)
+
             candidatos = []
+
+            # Dirección 1: en extracto pero NO en auxiliar
             for _, row in df_ext.iterrows():
                 for monto in [row.debito, row.credito]:
                     if monto < 1000: continue
-                    if not _en_auxiliar(monto):
+                    if not _tiene_par(monto, aux_montos):
                         candidatos.append({
+                            "origen":      "en extracto, falta en auxiliar",
                             "fecha":       row.fecha,
                             "descripcion": row.descripcion,
                             "monto":       monto,
@@ -653,12 +660,26 @@ if st.button("Generar conciliación", type="primary"):
                             "dist_target": abs(monto - target),
                         })
 
+            # Dirección 2: en auxiliar pero NO en extracto
+            for _, row in df_inf.iterrows():
+                for monto in [row.debito, row.credito]:
+                    if monto < 1000: continue
+                    if not _tiene_par(monto, ext_montos):
+                        desc = getattr(row, "descripcion", "")
+                        comp = getattr(row, "comprobante", "")
+                        candidatos.append({
+                            "origen":      "en auxiliar, falta en extracto",
+                            "fecha":       row.fecha,
+                            "descripcion": f"{comp} {desc}".strip(),
+                            "monto":       monto,
+                            "tipo":        "DÉBITO" if monto == row.debito else "CRÉDITO",
+                            "dist_target": abs(monto - target),
+                        })
+
             if not candidatos:
                 return None
 
             candidatos.sort(key=lambda x: x["dist_target"])
-
-            # Si hay alguno dentro del 5 % del target, devolver el más cercano
             cerca = [c for c in candidatos if c["dist_target"] <= tol_dif]
             return cerca[0] if cerca else candidatos[0]
 
@@ -994,12 +1015,12 @@ if st.button("Generar conciliación", type="primary"):
         st.error(f"⚠️ Diferencia de **${diferencia:,.0f}**")
 
         if partida_faltante:
+            origen = partida_faltante["origen"]
             st.warning(
-                f"**Posible partida faltante en el auxiliar:**\n\n"
+                f"**Posible partida faltante — {origen}:**\n\n"
                 f"- Fecha: {partida_faltante['fecha']}\n"
                 f"- Descripción: {partida_faltante['descripcion']}\n"
-                f"- Monto: **${partida_faltante['monto']:,.0f}** ({partida_faltante['tipo']})\n\n"
-                "Este movimiento aparece en el extracto bancario pero NO en el auxiliar contable."
+                f"- Monto: **${partida_faltante['monto']:,.0f}** ({partida_faltante['tipo']})"
             )
 
     nombre_salida = uploaded_ext.name.replace(".pdf", "_conciliacion.xlsx")
