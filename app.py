@@ -1,13 +1,11 @@
 from __future__ import annotations
 import os
 import re
-import shutil
 import tempfile
 import numpy as np
 import pandas as pd
 from datetime import date, datetime, timedelta
-from pdf2image import convert_from_path, convert_from_bytes
-import pytesseract
+import fitz                 # PyMuPDF — extrae texto e imágenes sin binarios del sistema
 try:
     import pdfplumber
     _HAS_PDFPLUMBER = True
@@ -17,50 +15,14 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from PIL import Image
 import io
-
-import subprocess as _sp
-
-def _find_bin(name):
-    for d in ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"):
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            return p
-    # buscar con find en /usr
-    try:
-        r = _sp.run(["find", "/usr", "-name", name, "-type", "f", "-maxdepth", "6"],
-                    capture_output=True, text=True, timeout=5)
-        hits = [l.strip() for l in r.stdout.splitlines() if l.strip()]
-        if hits:
-            return hits[0]
-    except Exception:
-        pass
-    return shutil.which(name)
-
-_POPPLER_PATH = next(
-    (d for d in ("/usr/bin", "/usr/local/bin") if os.path.isfile(os.path.join(d, "pdftoppm"))),
-    None
-)
-_TESSERACT_BIN = _find_bin("tesseract")
-if _TESSERACT_BIN:
-    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_BIN
 
 st.set_page_config(
     page_title="Conciliación Bancaria",
     page_icon="🏦",
     layout="centered",
 )
-
-st.title("🏦 Conciliación Bancaria")
-
-with st.expander("Diagnóstico del sistema", expanded=False):
-    st.code(f"tesseract: {_TESSERACT_BIN or 'NO ENCONTRADO'}\npoppler:   {_POPPLER_PATH or 'NO ENCONTRADO'}")
-    try:
-        r = _sp.run(["find", "/usr", "-name", "tesseract", "-maxdepth", "6"],
-                    capture_output=True, text=True, timeout=5)
-        st.code(f"find tesseract:\n{r.stdout or '(nada)'}")
-    except Exception as e:
-        st.code(f"find error: {e}")
 
 col_a, col_b = st.columns(2)
 uploaded_ext = col_a.file_uploader("📄 Extracto bancario (PDF)", type="pdf")
@@ -121,24 +83,48 @@ if st.button("Generar conciliación", type="primary"):
             if cur: lines.append(sorted(cur))
             return lines, page.width
 
-        def _ocr_lines(img):
-            df = pytesseract.image_to_data(
-                img, lang="spa", config="--psm 6",
-                output_type=pytesseract.Output.DATAFRAME
-            )
-            df = df[df.conf > 0].dropna(subset=["text"]).copy()
-            df["text"] = df["text"].astype(str).str.strip()
-            df = df[df["text"] != ""].sort_values(["top", "left"])
+        def _fitz_lines(pdf_path, page_num=0):
+            """Extrae líneas de texto de una página usando PyMuPDF (sin binarios del sistema)."""
+            doc = fitz.open(pdf_path)
+            page = doc[page_num]
+            words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,word_idx)
+            doc.close()
+            if not words:
+                return [], page.rect.width
+            w = page.rect.width
+            # Agrupar por Y (tolerancia 4pt)
             lines, cur, cur_y = [], [], None
-            for _, row in df.iterrows():
-                if cur_y is None or abs(row["top"] - cur_y) <= 12:
-                    cur.append((row["left"], row["text"]))
-                    cur_y = cur_y or row["top"]
+            for x0, y0, x1, y1, word, *_ in sorted(words, key=lambda r: (round(r[1], 1), r[0])):
+                if cur_y is None or abs(y0 - cur_y) <= 4:
+                    cur.append((x0, word))
+                    if cur_y is None: cur_y = y0
                 else:
                     if cur: lines.append(sorted(cur))
-                    cur, cur_y = [(row["left"], row["text"])], row["top"]
+                    cur, cur_y = [(x0, word)], y0
             if cur: lines.append(sorted(cur))
-            return lines
+            return lines, w
+
+        def _fitz_all_lines(pdf_path):
+            """Extrae líneas de todas las páginas con PyMuPDF."""
+            doc = fitz.open(pdf_path)
+            all_lines = []
+            widths = []
+            for page in doc:
+                words = page.get_text("words")
+                w = page.rect.width
+                widths.append(w)
+                lines, cur, cur_y = [], [], None
+                for x0, y0, x1, y1, word, *_ in sorted(words, key=lambda r: (round(r[1],1), r[0])):
+                    if cur_y is None or abs(y0 - cur_y) <= 4:
+                        cur.append((x0, word))
+                        if cur_y is None: cur_y = y0
+                    else:
+                        if cur: lines.append(sorted(cur))
+                        cur, cur_y = [(x0, word)], y0
+                if cur: lines.append(sorted(cur))
+                all_lines.append((lines, w))
+            doc.close()
+            return all_lines
 
         # ── Extracto: parser genérico (Itau, Banco de Bogotá, etc.) ─────────────
         def _clean(t: str) -> str:
@@ -275,80 +261,57 @@ if st.button("Generar conciliación", type="primary"):
                                 return v
             return None
 
-        def _pdf_to_images(pdf_path, dpi=150):
-            """Convierte PDF a imágenes PIL sin necesitar poppler del sistema."""
-            # Intento 1: pdfplumber (usa pypdfium2 internamente en v0.11+)
-            try:
-                imgs = []
-                with pdfplumber.open(pdf_path) as pdf:
-                    for page in pdf.pages:
-                        imgs.append(page.to_image(resolution=dpi).original)
-                if imgs:
-                    return imgs
-            except Exception:
-                pass
-            # Intento 2: pdf2image con poppler
-            try:
-                with open(pdf_path, "rb") as f:
-                    return convert_from_bytes(f.read(), dpi=dpi,
-                                              poppler_path=_POPPLER_PATH)
-            except Exception:
-                pass
-            return []
+        def _fitz_page_lines(page):
+            """Extrae líneas (x, word) de una página fitz. No necesita binarios."""
+            words = page.get_text("words")  # (x0,y0,x1,y1,text,block,line,idx)
+            w = page.rect.width
+            if not words:
+                return [], w
+            lines, cur, cur_y = [], [], None
+            for x0, y0, x1, y1, word, *_ in sorted(words, key=lambda r: (round(r[1],1), r[0])):
+                if cur_y is None or abs(y0 - cur_y) <= 4:
+                    cur.append((x0, word))
+                    if cur_y is None: cur_y = y0
+                else:
+                    if cur: lines.append(sorted(cur))
+                    cur, cur_y = [(x0, word)], y0
+            if cur: lines.append(sorted(cur))
+            return lines, w
 
         def parse_extracto(ano, mes):
-            # pdfplumber: lee texto directo del PDF (sin OCR, sin poppler)
             all_rows = []
             filas_por_pagina = []
-            images = None
-            plumber_ok = False
-            plumber_sample = []   # primeras líneas de página 1 para debug
+            debug_sample = []
             try:
-                with pdfplumber.open(pdf_ext_path) as pdf:
-                    n_pages = len(pdf.pages)
-                    for pg, page in enumerate(pdf.pages, 1):
-                        words = page.extract_words(x_tolerance=3, y_tolerance=3)
-                        lines, w = _plumber_lines(page)
-                        if pg == 1:
-                            raw_text = page.extract_text() or ""
-                            plumber_sample = [
-                                f"Páginas: {n_pages} | Palabras p1: {len(words)} | Ancho: {round(w,1)}",
-                                f"Texto raw p1 (primeras 300 chars): {raw_text[:300]!r}",
-                            ] + [
-                                " | ".join(t for _, t in ln)
-                                for ln in lines[:8]
-                            ]
-                        page_rows = _parse_extracto_page(lines, w)
-                        filas_por_pagina.append((pg, len(page_rows), "pdf"))
-                        all_rows.extend(page_rows)
-                plumber_ok = True
-            except Exception as e:
-                all_rows = []
-                plumber_sample = [f"ERROR: {e}"]
-
-            st.session_state["plumber_sample"] = plumber_sample
-
-            # Solo usar OCR si pdfplumber lanzó excepción (no por pocas filas)
-            if not plumber_ok:
-                images = _pdf_to_images(pdf_ext_path, dpi=150)
-                for pg, img in enumerate(images, 1):
-                    try:
-                        page_rows = _parse_extracto_page(_ocr_lines(img), img.width)
-                    except Exception:
-                        page_rows = []
-                    filas_por_pagina.append((pg, len(page_rows), "ocr"))
+                doc = fitz.open(pdf_ext_path)
+                n = len(doc)
+                for pg, page in enumerate(doc, 1):
+                    lines, w = _fitz_page_lines(page)
+                    if pg == 1:
+                        raw = page.get_text("text") or ""
+                        debug_sample = [
+                            f"Motor: PyMuPDF | Páginas: {n} | Palabras p1: {len(page.get_text('words'))} | Ancho: {round(w,1)}",
+                            f"Texto raw p1: {raw[:300]!r}",
+                        ] + [" | ".join(t for _, t in ln) for ln in lines[:8]]
+                    page_rows = _parse_extracto_page(lines, w)
+                    filas_por_pagina.append((pg, len(page_rows), "fitz"))
                     all_rows.extend(page_rows)
-                st.session_state["ext_debug"] = filas_por_pagina
+                doc.close()
+            except Exception as e:
+                debug_sample = [f"ERROR fitz: {e}"]
+
+            st.session_state["plumber_sample"] = debug_sample
+            st.session_state["ext_debug"]      = filas_por_pagina
 
             if not all_rows:
-                return pd.DataFrame(), images
+                return pd.DataFrame(), None
             df = pd.DataFrame(all_rows)
             def _make_date(row):
                 m = int(row["mes"]) if pd.notna(row.get("mes")) and row.get("mes") else mes
                 max_day = 28 if m == 2 else 30 if m in [4,6,9,11] else 31
                 return date(ano, m, min(int(row["dia"]), max_day))
             df["fecha"] = df.apply(_make_date, axis=1)
-            return df.sort_values("fecha").reset_index(drop=True), images
+            return df.sort_values("fecha").reset_index(drop=True), None
 
         # ── Informe Movimiento General (última página) ────────────────────────
         # Sin posiciones fijas: usa delta de saldo para determinar débito/crédito
@@ -458,24 +421,61 @@ if st.button("Generar conciliación", type="primary"):
             return pd.DataFrame(rows) if rows else pd.DataFrame(
                 columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
 
+        def _parse_informe_fitz(lines, w):
+            """Parsea líneas del auxiliar extraídas por fitz."""
+            rows = []
+            prev_saldo = None
+            for line in lines:
+                comprobante = next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None)
+                if not comprobante: continue
+                fecha_str = next((t for _, t in line if re.match(r"^\d{4}/\d{2}/\d{2}$", t)), None)
+                if not fecha_str: continue
+                try:    fecha = datetime.strptime(fecha_str, "%Y/%m/%d").date()
+                except: continue
+                amounts = sorted(
+                    [(x, _parse_num(t)) for x, t in line
+                     if _is_currency(t) and _parse_num(t) and _parse_num(t) > 0
+                     and x > w * 0.50],
+                    key=lambda a: a[0]
+                )
+                if not amounts: continue
+                saldo = amounts[-1][1]
+                non_saldo = [v for _, v in amounts[:-1]]
+                if not non_saldo: continue
+                amount = non_saldo[-1]
+                if prev_saldo is not None:
+                    debito, credito = (amount, 0.0) if saldo >= prev_saldo else (0.0, amount)
+                else:
+                    x_amt = amounts[-2][0] if len(amounts) >= 2 else 0
+                    debito, credito = (amount, 0.0) if x_amt < w * 0.68 else (0.0, amount)
+                prev_saldo = saldo
+                fecha_x = next((x for x, t in line if t == fecha_str), 0)
+                monto_x  = amounts[-2][0] if len(amounts) >= 2 else w
+                desc = " ".join(t for x, t in sorted(line)
+                    if x > fecha_x and x < monto_x
+                    and not re.match(r"^[\d,\.]+$", t)
+                    and t not in ("O", "0", "SUC", "NIT")).strip()
+                rows.append({"comprobante": comprobante, "fecha": fecha, "descripcion": desc,
+                             "debito": debito, "credito": credito, "saldo": saldo})
+            return pd.DataFrame(rows) if rows else pd.DataFrame(
+                columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
+
         def parse_auxiliar():
-            """Procesa auxiliar con pdfplumber (sin OCR)."""
+            """Procesa auxiliar con PyMuPDF (sin binarios del sistema)."""
             all_rows = []
             aux_sample = []
             try:
-                with pdfplumber.open(pdf_aux_path) as pdf:
-                    for pg, page in enumerate(pdf.pages, 1):
-                        if pg == 1:
-                            lines_p, _ = _plumber_lines(page)
-                            aux_sample = [
-                                " | ".join(t for _, t in ln)
-                                for ln in lines_p[:8]
-                            ]
-                        df_p = _parse_informe_plumber(page)
-                        if not df_p.empty:
-                            all_rows.append(df_p)
+                doc = fitz.open(pdf_aux_path)
+                for pg, page in enumerate(doc, 1):
+                    lines, w = _fitz_page_lines(page)
+                    if pg == 1:
+                        aux_sample = [" | ".join(t for _, t in ln) for ln in lines[:8]]
+                    df_p = _parse_informe_fitz(lines, w)
+                    if not df_p.empty:
+                        all_rows.append(df_p)
+                doc.close()
             except Exception as e:
-                aux_sample = [f"ERROR: {e}"]
+                aux_sample = [f"ERROR fitz: {e}"]
 
             st.session_state["aux_sample"] = aux_sample
             if not all_rows:
