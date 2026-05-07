@@ -497,11 +497,16 @@ if st.button("Generar conciliación", type="primary"):
 
         def _parse_informe_fitz(lines, w, col_split=None, has_movimiento=False):
             """
-            Parsea el auxiliar contable.
-            col_split: x0 del midpoint entre encabezados DÉBITOS y CRÉDITOS.
-            has_movimiento: True si existe columna MOVIMIENTO a la derecha del SALDO
-                            → el rightmost amount es MOVIMIENTO (ignorar), not SALDO.
+            Layout: DÉBITO | CRÉDITO | SALDO [| MOVIMIENTO]
+            Ordena por borde derecho estimado (xr) para que columnas right-aligned
+            queden en el orden correcto aunque números grandes tengan x0 muy a la izq.
+            cw: ancho de carácter en px (OCR 300dpi) o pt (fitz).
             """
+            cw = 27 if w > 1000 else 6.5   # OCR pixels vs fitz points
+
+            def _xr(x0, text):
+                return x0 + len(text) * cw
+
             rows = []
             for line in lines:
                 comprobante = next((t for _, t in line if _COMP_RE.match(t)), None)
@@ -511,60 +516,46 @@ if st.button("Generar conciliación", type="primary"):
                 try:    fecha = datetime.strptime(fecha_str, "%Y/%m/%d").date()
                 except: continue
 
-                # Recoger montos: guardar (x0_original, valor)
-                raw_amounts = [
-                    (x, _to_float(t)) for x, t in line
-                    if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
-                    and x > w * 0.45
-                ]
-                raw_amounts.sort(key=lambda a: a[0])   # izq → der por x0 original
+                # (x0_original, xr_estimado, valor) ordenado por xr → orden de columnas correcto
+                raw_amounts = sorted(
+                    [(x, _xr(x, t), _to_float(t)) for x, t in line
+                     if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
+                     and x > w * 0.45],
+                    key=lambda a: a[1]
+                )
                 if not raw_amounts: continue
 
                 x0_primer = raw_amounts[0][0]   # para delimitar la descripción
 
-                # ── Identificar SALDO y montos de transacción ──────────────────
-                # Layout: DÉBITO | CRÉDITO | SALDO [| MOVIMIENTO]
-                # "0,00" nunca llega aquí (filtrado por abs()>0), así que solo
-                # vienen columnas con valor real.
-                # has_movimiento=True → rightmost = MOVIMIENTO (ignorar), second = SALDO
+                # has_movimiento → rightmost (por xr) = MOVIMIENTO, descartarlo
                 if has_movimiento:
                     if len(raw_amounts) < 2: continue
-                    saldo = abs(raw_amounts[-2][1])
-                    txn   = raw_amounts[:-2]   # todo antes de SALDO y MOVIMIENTO
+                    saldo = abs(raw_amounts[-2][2])
+                    txn   = raw_amounts[:-2]
                 else:
-                    saldo = abs(raw_amounts[-1][1])
-                    txn   = raw_amounts[:-1]   # todo antes de SALDO
+                    saldo = abs(raw_amounts[-1][2])
+                    txn   = raw_amounts[:-1]
 
                 if not txn: continue
 
-                # ── Clasificar transacción en DÉBITO / CRÉDITO ─────────────────
-                # Usamos x0 del monto (borde izquierdo real) vs col_split,
-                # que es el midpoint entre los x0 de los encabezados DÉBITOS/CRÉDITOS.
-                # Para montos right-aligned, x0 del monto < x0 del encabezado de su col;
-                # el midpoint entre las dos columnas sigue siendo un separador fiable.
                 if len(txn) == 1:
-                    x0_a, val_a = txn[0]
+                    x0_a, xr_a, val_a = txn[0]
                     val = abs(val_a)
                     if col_split is not None:
-                        debito, credito = (val, 0.0) if x0_a < col_split else (0.0, val)
+                        debito, credito = (val, 0.0) if xr_a < col_split else (0.0, val)
                     else:
-                        # Sin info de encabezado: usar posición relativa
-                        x0_saldo = raw_amounts[-2][0] if has_movimiento else raw_amounts[-1][0]
-                        mid = (w * 0.45 + x0_saldo) / 2
-                        debito, credito = (val, 0.0) if x0_a < mid else (0.0, val)
+                        xr_s = raw_amounts[-2][1] if has_movimiento else raw_amounts[-1][1]
+                        mid  = (w * 0.45 + xr_s) / 2
+                        debito, credito = (val, 0.0) if xr_a < mid else (0.0, val)
                 else:
-                    # 2+ montos antes del SALDO: clasificar cada uno por posición
-                    debito  = 0.0
-                    credito = 0.0
-                    for x0_a, val_a in txn:
+                    debito = credito = 0.0
+                    for x0_a, xr_a, val_a in txn:
                         if col_split is not None:
-                            if x0_a < col_split:
-                                debito  = max(debito,  abs(val_a))
-                            else:
-                                credito = max(credito, abs(val_a))
+                            if xr_a < col_split: debito  = max(debito,  abs(val_a))
+                            else:                credito = max(credito, abs(val_a))
                         else:
-                            debito = abs(txn[0][1])
-                            credito = abs(txn[-1][1])
+                            debito  = abs(txn[0][2])
+                            credito = abs(txn[-1][2])
                             break
 
                 if debito == 0 and credito == 0: continue
@@ -658,10 +649,14 @@ if st.button("Generar conciliación", type="primary"):
                         if has_movimiento: break
                     if has_movimiento: break
 
-            # col_split: midpoint entre x0 de los encabezados (sin estimar ancho de carácter)
+            # col_split: midpoint entre xr de los encabezados, usando el mismo cw de _parse_informe_fitz
             col_split = None
             if x0_deb is not None and x0_cred is not None:
-                col_split = (x0_deb + x0_cred) / 2
+                first_w = all_pages[0][1] if all_pages else 595
+                cw = 27 if first_w > 1000 else 6.5
+                xr_deb  = x0_deb  + len("DÉBITOS")  * cw
+                xr_cred = x0_cred + len("CRÉDITOS") * cw
+                col_split = (xr_deb + xr_cred) / 2
             st.session_state["col_split_debug"] = (
                 f"x0_deb={x0_deb} x0_cred={x0_cred} col_split={col_split} "
                 f"has_movimiento={has_movimiento}"
