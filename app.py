@@ -154,21 +154,17 @@ if st.button("Generar conciliación", type="primary"):
             for line in lines:
                 if not line: continue
 
-                # Detectar fecha en los primeros tokens (dentro del 15% izquierdo)
-                # Acepta: DD/MM (Banco de Bogotá), DD solo (Itau)
-                day = None
-                mon = None
+                # ── Detectar fecha (primeros tokens, zona flexible hasta 25%) ───
+                day, mon = None, None
                 for tok_x, tok_t in line:
-                    if tok_x >= w * 0.15:
-                        break          # ya salimos de la zona de fecha
+                    if tok_x >= w * 0.25:
+                        break
                     tc = _clean(tok_t)
-                    # DD/MM
                     m = re.match(r"^(\d{1,2})[/\-](\d{2})$", tc)
                     if m:
-                        d = int(m.group(1)); mo = int(m.group(2))
+                        d, mo = int(m.group(1)), int(m.group(2))
                         if 1 <= d <= 31 and 1 <= mo <= 12:
-                            day = d; mon = mo; break
-                    # Solo DD
+                            day, mon = d, mo; break
                     if re.match(r"^\d{1,2}$", tc):
                         d = int(tc)
                         if 1 <= d <= 31:
@@ -176,75 +172,57 @@ if st.button("Generar conciliación", type="primary"):
 
                 if day is None: continue
 
-                # Dos zonas por posición X:
-                #   Transacción (cargo/abono): 55 %–80 % del ancho
-                #   Saldo:                     > 80 % del ancho
-                # Esto evita confundir NITs, referencias y saldos entre sí.
-                txn_amounts   = []   # (x, valor) en zona cargo/abono
-                saldo_amounts = []   # (x, valor) en zona saldo
+                # ── Recopilar todos los montos en la mitad derecha ─────────────
+                # Estrategia: tomar todos los números monetarios (x > 45% del ancho),
+                # ordenarlos de izquierda a derecha.
+                # El más a la derecha = saldo; el anterior = monto de transacción.
+                all_amounts = []   # (x, valor)
                 i = 0
-                tokens = line
-                while i < len(tokens):
-                    x, t = tokens[i]
+                while i < len(line):
+                    x, t = line[i]
                     tc = _clean(t)
-                    if x < w * 0.55:          # zona de descripción → ignorar
+                    if x < w * 0.45:
                         i += 1; continue
-                    # Monto negativo partido: "-" y "1,234.00"
-                    if tc == "-" and i + 1 < len(tokens):
-                        nx, nt = tokens[i+1]
-                        if _is_amount(nt) and nx >= w * 0.55 and (nx - x) < w * 0.05:
+                    # Monto negativo partido: "-" seguido de número
+                    if tc == "-" and i + 1 < len(line):
+                        nx, nt = line[i+1]
+                        if _is_amount(nt) and nx >= w * 0.45 and (nx - x) < w * 0.08:
                             v = _to_float(nt)
-                            if v:
-                                if nx > w * 0.80: saldo_amounts.append((nx, -abs(v)))
-                                else:             txn_amounts.append((nx, -abs(v)))
+                            if v: all_amounts.append((nx, -abs(v)))
                             i += 2; continue
                     if _is_amount(tc):
                         v = _to_float(tc)
-                        if v is not None and abs(v) >= 100:   # excluir artefactos menores a $100
-                            if x > w * 0.80: saldo_amounts.append((x, v))
-                            else:             txn_amounts.append((x, v))
+                        if v is not None and abs(v) >= 50:
+                            all_amounts.append((x, v))
                     i += 1
 
-                if not saldo_amounts or not txn_amounts: continue
+                if len(all_amounts) < 2: continue
 
-                # Saldo: monto más a la derecha en la zona de saldo
-                saldo_amounts.sort(key=lambda a: a[0])
-                saldo = abs(saldo_amounts[-1][1])
+                all_amounts.sort(key=lambda a: a[0])
+                saldo = abs(all_amounts[-1][1])
+                valor = all_amounts[-2][1]
 
-                # Transacción: monto más a la derecha en la zona cargo/abono
-                txn_amounts.sort(key=lambda a: a[0])
-                x_valor = txn_amounts[-1][0]
-                valor   = txn_amounts[-1][1]
-
-                # Clasificar cargo vs abono:
-                #   Banco de Bogotá (columna única "Valor"): negativo = cargo, positivo = abono
-                #   Itaú (columnas separadas): posición determina la dirección
+                # ── Clasificar débito / crédito ────────────────────────────────
+                desc_tokens = [t for x, t in line if not _is_amount(t) and x < all_amounts[-2][0]]
+                desc_lower  = " ".join(desc_tokens).lower()
+                cargo_kw = {"cargo", "giro", "gravamen", " db ", "pago",
+                            "impuesto", "cheque", "comision", "débito", "debito"}
                 if valor < 0:
-                    # Signo negativo → siempre cargo (salida)
                     debito, credito = abs(valor), 0.0
+                elif any(k in desc_lower for k in cargo_kw):
+                    debito, credito = valor, 0.0
                 else:
-                    # Valor positivo: usar palabras clave de la descripción
-                    desc_tokens = [t for x, t in line if w*0.10 < x < w*0.65 and not _is_amount(t)]
-                    desc_lower  = " ".join(desc_tokens).lower()
-                    # Palabras que indican CARGO (salida de dinero)
-                    cargo_kw = {"cargo", "giro", "gravamen", " db ", "pago",
-                                "impuesto", "cheque", "comision"}
-                    if any(k in desc_lower for k in cargo_kw):
-                        debito, credito = valor, 0.0
-                    else:
-                        # Por defecto positivo = abono (entrada de dinero)
-                        # Cubre: "Cr Ach", "Abono", "consignacion", transferencias entrantes
-                        debito, credito = 0.0, valor
+                    debito, credito = 0.0, valor
 
-                # Descripción: tokens entre fecha y el inicio de la zona de transacción
-                min_txn_x = txn_amounts[0][0]
+                # ── Descripción: tokens no-numéricos entre fecha y primer monto ─
+                first_amount_x = all_amounts[0][0]
                 desc_parts = [
                     _clean(t) for x, t in line
-                    if w * 0.10 < x < min_txn_x - w * 0.02
+                    if w * 0.08 < x < first_amount_x - w * 0.01
                     and not _is_amount(t)
                     and len(_clean(t)) > 1
                 ]
-                desc = " ".join(desc_parts[:10])
+                desc = " ".join(desc_parts[:12])
 
                 rows.append({
                     "dia": day, "mes": mon, "descripcion": desc,
@@ -560,127 +538,77 @@ if st.button("Generar conciliación", type="primary"):
 
         # ── Matching ──────────────────────────────────────────────────────────
         def reconciliar(df_ext, df_inf, diferencia_saldos):
-            # Índice: (fecha, monto_redondeado, tipo D/C) → lista de índices
+            # Índice de extracto: (fecha, monto_redondeado_100, tipo) → lista de índices
+            # Redondear a $100 para absorber diferencias de centavos del OCR
             ext_idx = {}
             for i, row in df_ext.iterrows():
                 for monto, tipo in [(row.debito,"D"),(row.credito,"C")]:
                     if monto > 0:
-                        ext_idx.setdefault((row.fecha, round(monto), tipo), []).append(i)
+                        key = (row.fecha, round(monto / 100) * 100, tipo)
+                        ext_idx.setdefault(key, []).append(i)
 
             matched_ext, matched_inf = set(), set()
             for i, row in df_inf.iterrows():
-                # Débito en libros ↔ Crédito (abono) en banco
-                # Crédito en libros ↔ Débito (cargo) en banco
                 for monto, tipo_ext in [(row.debito,"C"),(row.credito,"D")]:
                     if monto <= 0: continue
                     found = False
-                    # Tolerancia ±5 días: el banco registra en fecha valor, contabilidad
-                    # registra en fecha de autorización (diferencia típica 1-5 días hábiles)
-                    for day_d in [0, -1, -2, -3, -4, -5, 1, 2, 3]:
+                    # ±10 días de tolerancia fecha, ±1% de tolerancia monto
+                    tol_amt = max(round(monto * 0.01 / 100) * 100, 1000)
+                    for day_d in [0,-1,-2,-3,-4,-5,-6,-7,-8,-9,-10,1,2,3,4,5]:
                         fecha_try = row.fecha + timedelta(days=day_d)
-                        for amt_d in [0, 1, -1]:
-                            key = (fecha_try, round(monto + amt_d), tipo_ext)
-                            if key in ext_idx and ext_idx[key]:
-                                matched_ext.add(ext_idx[key].pop(0))
-                                matched_inf.add(i)
-                                found = True; break
+                        for amt_step in range(0, int(tol_amt) + 100, 100):
+                            for sign in ([0] if amt_step == 0 else [amt_step, -amt_step]):
+                                key = (fecha_try, round((monto + sign) / 100) * 100, tipo_ext)
+                                if key in ext_idx and ext_idx[key]:
+                                    matched_ext.add(ext_idx[key].pop(0))
+                                    matched_inf.add(i)
+                                    found = True; break
+                            if found: break
                         if found: break
-
-            # Partidas no cruzadas del extracto → Notas no contabilizadas
-            notas_cargo, notas_abono = [], []
-            for i, row in df_ext.iterrows():
-                if i in matched_ext: continue
-                if row.debito > 0:
-                    notas_cargo.append({"fecha": row.fecha, "descripcion": row.descripcion, "monto": row.debito})
-                if row.credito > 0:
-                    notas_abono.append({"fecha": row.fecha, "descripcion": row.descripcion, "monto": row.credito})
-
-            # Partidas no cruzadas del auxiliar
-            cheques_pend, ingresos_pend = [], []
-            for i, row in df_inf.iterrows():
-                if i in matched_inf: continue
-                if row.credito > 0:
-                    cheques_pend.append({
-                        "fecha": row.fecha, "beneficiario": row.descripcion,
-                        "comprobante": row.comprobante, "monto": row.credito,
-                    })
-                if row.debito > 0:
-                    ingresos_pend.append({
-                        "fecha": row.fecha, "descripcion": row.descripcion,
-                        "comprobante": row.comprobante, "monto": row.debito,
-                    })
 
             _e = lambda lst, cols: pd.DataFrame(lst) if lst else pd.DataFrame(columns=cols)
             emp = lambda cols: pd.DataFrame(columns=cols)
 
-            # El banco agrupa pagos en lotes → el cruce 1:1 falla casi siempre.
-            # Estrategia: ignorar el cruce y buscar directamente la(s) partida(s)
-            # cuyo monto explica la diferencia entre saldos.
-            target = round(abs(diferencia_saldos))
-
-            if target == 0:
-                # Saldos iguales → no hay partidas pendientes
+            if round(abs(diferencia_saldos)) == 0:
                 return (emp(["fecha","beneficiario","comprobante","monto"]),
                         emp(["fecha","descripcion","monto"]),
                         emp(["fecha","descripcion","monto"]),
                         emp(["fecha","descripcion","comprobante","monto"]),
                         True)
 
-            tol = max(round(target * 0.005), 500)  # ±0.5% del target, mínimo $500
+            # Devolver TODAS las partidas sin cruzar (no solo la más cercana al target)
+            notas_cargo, notas_abono = [], []
+            for i, row in df_ext.iterrows():
+                if i in matched_ext: continue
+                if row.debito > 0:
+                    notas_cargo.append({"fecha": row.fecha, "descripcion": row.descripcion,
+                                        "monto": row.debito})
+                if row.credito > 0:
+                    notas_abono.append({"fecha": row.fecha, "descripcion": row.descripcion,
+                                        "monto": row.credito})
 
-            # Candidatos: partidas cuyo monto individual ≈ target
-            # Según el signo de la diferencia buscamos en las categorías correctas:
-            #   diferencia < 0 (extracto < libros): cargo banco no en libros,
-            #                                       o débito libros no en banco
-            #   diferencia > 0 (extracto > libros): abono banco no en libros,
-            #                                       o crédito libros no en banco
-            if diferencia_saldos <= 0:
-                candidatos = (
-                    [("nc", x) for x in notas_cargo   if abs(x["monto"] - target) <= tol] +
-                    [("ip", x) for x in ingresos_pend if abs(x["monto"] - target) <= tol]
-                )
-            else:
-                candidatos = (
-                    [("na", x) for x in notas_abono   if abs(x["monto"] - target) <= tol] +
-                    [("ch", x) for x in cheques_pend  if abs(x["monto"] - target) <= tol]
-                )
+            cheques_pend, ingresos_pend = [], []
+            for i, row in df_inf.iterrows():
+                if i in matched_inf: continue
+                if row.credito > 0:
+                    cheques_pend.append({"fecha": row.fecha, "beneficiario": row.descripcion,
+                                         "comprobante": row.comprobante, "monto": row.credito})
+                if row.debito > 0:
+                    ingresos_pend.append({"fecha": row.fecha, "descripcion": row.descripcion,
+                                          "comprobante": row.comprobante, "monto": row.debito})
 
-            if candidatos:
-                # Elegir el más cercano al target
-                cat, item = min(candidatos, key=lambda t: abs(t[1]["monto"] - target))
-                return (
-                    _e([item] if cat == "ch" else [], ["fecha","beneficiario","comprobante","monto"]),
-                    _e([item] if cat == "nc" else [], ["fecha","descripcion","monto"]),
-                    _e([item] if cat == "na" else [], ["fecha","descripcion","monto"]),
-                    _e([item] if cat == "ip" else [], ["fecha","descripcion","comprobante","monto"]),
-                    True,
-                )
+            # Ordenar por monto desc para que lo más relevante aparezca primero
+            notas_cargo.sort(  key=lambda x: x["monto"], reverse=True)
+            notas_abono.sort(  key=lambda x: x["monto"], reverse=True)
+            cheques_pend.sort( key=lambda x: x["monto"], reverse=True)
+            ingresos_pend.sort(key=lambda x: x["monto"], reverse=True)
 
-            # Si no se encontró una sola partida, intentar con ambos lados
-            # (por si el signo del OCR es incorrecto)
-            todos = (
-                [("nc", x) for x in notas_cargo   if abs(x["monto"] - target) <= tol] +
-                [("na", x) for x in notas_abono   if abs(x["monto"] - target) <= tol] +
-                [("ch", x) for x in cheques_pend  if abs(x["monto"] - target) <= tol] +
-                [("ip", x) for x in ingresos_pend if abs(x["monto"] - target) <= tol]
-            )
-            if todos:
-                cat, item = min(todos, key=lambda t: abs(t[1]["monto"] - target))
-                return (
-                    _e([item] if cat == "ch" else [], ["fecha","beneficiario","comprobante","monto"]),
-                    _e([item] if cat == "nc" else [], ["fecha","descripcion","monto"]),
-                    _e([item] if cat == "na" else [], ["fecha","descripcion","monto"]),
-                    _e([item] if cat == "ip" else [], ["fecha","descripcion","comprobante","monto"]),
-                    True,
-                )
-
-            # No se encontró la partida explicativa
             return (
-                emp(["fecha","beneficiario","comprobante","monto"]),
-                emp(["fecha","descripcion","monto"]),
-                emp(["fecha","descripcion","monto"]),
-                emp(["fecha","descripcion","comprobante","monto"]),
-                False,
+                _e(cheques_pend,  ["fecha","beneficiario","comprobante","monto"]),
+                _e(notas_cargo,   ["fecha","descripcion","monto"]),
+                _e(notas_abono,   ["fecha","descripcion","monto"]),
+                _e(ingresos_pend, ["fecha","descripcion","comprobante","monto"]),
+                True,
             )
 
         # ── Excel output ──────────────────────────────────────────────────────
@@ -859,6 +787,87 @@ if st.button("Generar conciliación", type="primary"):
                     _fmt_cop(row.credito) if row.credito>0 else "",
                     _fmt_cop(row.saldo)], fill)
 
+            # ── Hoja 4: Comparativo — todo lo que no cruzó ────────────────────
+            ws4 = wb.create_sheet("Comparativo")
+            # Anchos: Fecha, Descripción, Monto | Comprobante, Fecha, Descripción, Monto
+            for col, cw in zip("ABCDEFG",[12,40,20,18,12,40,20]):
+                ws4.column_dimensions[col].width = cw
+
+            # Título
+            ws4.merge_cells("A1:G1")
+            t1 = ws4["A1"]
+            t1.value = "COMPARATIVO DE MOVIMIENTOS SIN CRUZAR"
+            t1.font = Font(bold=True, size=13, color="FFFFFF")
+            t1.fill = PatternFill("solid", fgColor="1F3864")
+            t1.alignment = Alignment(horizontal="center", vertical="center")
+            ws4.row_dimensions[1].height = 28
+
+            # Subtítulos de cada columna
+            ws4.merge_cells("A2:C2")
+            lbl_ext = ws4["A2"]
+            lbl_ext.value = f"EXTRACTO BANCO  ({len(notas_cargo)+len(notas_abono)} mov sin cruzar)"
+            lbl_ext.font = Font(bold=True, size=10, color="FFFFFF")
+            lbl_ext.fill = PatternFill("solid", fgColor="C00000")
+            lbl_ext.alignment = Alignment(horizontal="center")
+
+            ws4.merge_cells("E2:G2")
+            lbl_aux = ws4["E2"]
+            lbl_aux.value = f"AUXILIAR CONTABILIDAD  ({len(cheques)+len(ingresos)} mov sin cruzar)"
+            lbl_aux.font = Font(bold=True, size=10, color="FFFFFF")
+            lbl_aux.fill = PatternFill("solid", fgColor="375623")
+            lbl_aux.alignment = Alignment(horizontal="center")
+
+            # Cabeceras
+            for c, v in enumerate(["Fecha","Descripción","Monto"], 1):
+                cell = ws4.cell(row=3, column=c, value=v)
+                cell.font = Font(bold=True, color="FFFFFF", size=9)
+                cell.fill = _RED; cell.border = _BRD
+                cell.alignment = Alignment(horizontal="center")
+            for c, v in enumerate(["Comprobante","Fecha","Descripción","Monto"], 5):
+                cell = ws4.cell(row=3, column=c, value=v)
+                cell.font = Font(bold=True, color="FFFFFF", size=9)
+                cell.fill = _GRN; cell.border = _BRD
+                cell.alignment = Alignment(horizontal="center")
+
+            # Datos lado extracto (cargos y abonos sin cruzar)
+            ext_sin = (
+                [{"fecha": r["fecha"], "desc": r["descripcion"],
+                  "monto": f'-{_fmt_cop(r["monto"])}' } for r in notas_cargo.to_dict("records")] +
+                [{"fecha": r["fecha"], "desc": r["descripcion"],
+                  "monto": _fmt_cop(r["monto"])}        for r in notas_abono.to_dict("records")]
+            )
+            ext_sin.sort(key=lambda x: str(x["fecha"]))
+
+            # Datos lado auxiliar (débitos y créditos sin cruzar)
+            aux_sin = (
+                [{"comp": r["comprobante"], "fecha": r["fecha"],
+                  "desc": r["descripcion"], "monto": _fmt_cop(r["monto"])}
+                 for r in ingresos.to_dict("records")] +
+                [{"comp": r["comprobante"], "fecha": r["fecha"],
+                  "desc": r["descripcion"], "monto": f'-{_fmt_cop(r["monto"])}'}
+                 for r in cheques.to_dict("records")]
+            )
+            aux_sin.sort(key=lambda x: str(x["fecha"]))
+
+            n_rows = max(len(ext_sin), len(aux_sin))
+            _RRED  = PatternFill("solid", fgColor="FCE4D6")
+            _RGRN  = PatternFill("solid", fgColor="E2EFDA")
+            for idx in range(n_rows):
+                r = idx + 4
+                if idx < len(ext_sin):
+                    e = ext_sin[idx]
+                    for c, v in enumerate([str(e["fecha"]), e["desc"], e["monto"]], 1):
+                        cell = ws4.cell(row=r, column=c, value=v)
+                        cell.fill = _RRED; cell.border = _BRD
+                        cell.alignment = Alignment(vertical="center",
+                            wrap_text=(c==2), horizontal=("right" if c==3 else "left"))
+                if idx < len(aux_sin):
+                    a = aux_sin[idx]
+                    for c, v in enumerate([a["comp"], str(a["fecha"]), a["desc"], a["monto"]], 5):
+                        cell = ws4.cell(row=r, column=c, value=v)
+                        cell.fill = _RGRN; cell.border = _BRD
+                        cell.alignment = Alignment(vertical="center",
+                            wrap_text=(c==7), horizontal=("right" if c==8 else "left"))
 
             buf = io.BytesIO()
             wb.save(buf)
@@ -919,17 +928,20 @@ if st.button("Generar conciliación", type="primary"):
     col3.metric("Diferencia",          f"${diferencia:,.0f}" if diferencia is not None else "—",
                 delta_color="off" if diferencia==0 else "inverse")
 
+    n_ext = len(df_ext) if not df_ext.empty else 0
+    n_aux = len(df_inf) if not df_inf.empty else 0
+    st.caption(f"Extracto: **{n_ext} movimientos** extraídos   |   Auxiliar: **{n_aux} movimientos** extraídos")
+
     if diferencia == 0:
         st.success("✅ Conciliación completa — los saldos cuadran perfectamente.")
-    elif not matching_ok:
-        st.warning(
-            f"⚠️ Diferencia de **${diferencia:,.0f}**. "
-            "El extracto usa fechas valor y agrupa pagos en lotes (dispersiones), "
-            "lo que impide el cruce automático. "
-            "Las secciones del Excel están vacías — usa las hojas de detalle para identificar la partida."
-        )
     else:
-        st.error(f"⚠️ Diferencia de ${diferencia:,.0f} — revisa las partidas pendientes en el Excel.")
+        n_sin_ext = len(notas_cargo) + len(notas_abono)
+        n_sin_aux = len(cheques) + len(ingresos)
+        st.error(
+            f"⚠️ Diferencia de **${diferencia:,.0f}**  |  "
+            f"Extracto sin cruzar: {n_sin_ext} mov  |  Auxiliar sin cruzar: {n_sin_aux} mov  \n"
+            "Abre la hoja **Comparativo** del Excel para ver lado a lado qué no cuadra."
+        )
 
     nombre_salida = uploaded_ext.name.replace(".pdf", "_conciliacion.xlsx")
     st.download_button(
