@@ -662,40 +662,44 @@ if st.button("Generar conciliación", type="primary"):
                 return False
 
             if diferencia_saldos < 0:
-                # Banco < Contabilidad: el auxiliar tiene un DÉBITO extra que el banco no tiene.
-                # Un DÉBITO en auxiliar = entrada/ingreso registrado en contabilidad
-                # que inflà el saldo contable. Si el banco no lo tiene, el banco queda menor.
-                # (Un CRÉDITO extra en auxiliar haría lo opuesto: bajaría el saldo contable.)
-                ext_pool   = _build_pool(df_ext)
+                # Banco < Contabilidad: el auxiliar tiene un CRÉDITO (abono) extra
+                # que el banco no registró. Ese abono infla el saldo contable.
+                # Comparamos CRÉDITOs del auxiliar contra CRÉDITOs del extracto.
+                ext_c_pool = defaultdict(int)
+                for _, r in df_ext.iterrows():
+                    if r.credito > 0: ext_c_pool[_key(r.credito)] += 1
+
                 candidatos = []
                 for _, row in df_inf.iterrows():
-                    desc = getattr(row, "descripcion", "")
-                    comp = getattr(row, "comprobante", "")
-                    monto = row.debito          # solo DÉBITO en auxiliar
+                    monto = row.credito          # solo CRÉDITO en auxiliar
                     if monto < 1_000: continue
-                    if _consume(ext_pool, monto):
+                    if _consume(ext_c_pool, monto):
                         pass  # tiene par en el banco → ok
                     else:
                         dist = abs(monto - target)
                         if dist <= tol_dif:
+                            desc = getattr(row, "descripcion", "")
+                            comp = getattr(row, "comprobante", "")
                             candidatos.append({
-                                "origen":      "DÉBITO en auxiliar sin respaldo en extracto bancario",
+                                "origen":      "CRÉDITO en auxiliar sin respaldo en extracto bancario",
                                 "fecha":       row.fecha,
                                 "descripcion": f"{comp} {desc}".strip(),
                                 "monto":       monto,
-                                "tipo":        "DÉBITO",
+                                "tipo":        "CRÉDITO",
                                 "dist_target": dist,
                             })
             else:
-                # Banco > Contabilidad: el extracto tiene un CRÉDITO extra que el auxiliar no tiene.
-                # Un CRÉDITO en extracto = depósito/ingreso en el banco que contabilidad no registró,
-                # lo que infla el saldo bancario.
-                aux_pool   = _build_pool(df_inf)
+                # Banco > Contabilidad: el extracto tiene un CRÉDITO extra que
+                # el auxiliar no registró, inflando el saldo bancario.
+                aux_c_pool = defaultdict(int)
+                for _, r in df_inf.iterrows():
+                    if r.credito > 0: aux_c_pool[_key(r.credito)] += 1
+
                 candidatos = []
                 for _, row in df_ext.iterrows():
-                    monto = row.credito         # solo CRÉDITO en extracto
+                    monto = row.credito          # solo CRÉDITO en extracto
                     if monto < 1_000: continue
-                    if _consume(aux_pool, monto):
+                    if _consume(aux_c_pool, monto):
                         pass
                     else:
                         dist = abs(monto - target)
