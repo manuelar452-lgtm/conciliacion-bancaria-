@@ -652,23 +652,24 @@ if st.button("Generar conciliación", type="primary"):
             # Banco > Auxiliar → hay un CRÉDITO en extracto que falta en auxiliar
             #   (el banco registró un abono que contabilidad no capturó)
             if diferencia_saldos < 0:
-                # Buscar DÉBITO en auxiliar sin par en extracto
+                # Banco < Contabilidad: hay algo en el auxiliar que no está en el banco
+                # Buscar cualquier monto (débito O crédito) en auxiliar sin par en extracto
                 candidatos = []
                 for _, row in df_inf.iterrows():
-                    monto = row.debito
-                    if monto < 1000: continue
-                    dist = abs(monto - target)
-                    if dist <= tol_dif and not _tiene_par(monto, ext_montos):
-                        desc = getattr(row, "descripcion", "")
-                        comp = getattr(row, "comprobante", "")
-                        candidatos.append({
-                            "origen":      "DÉBITO en auxiliar sin respaldo en extracto bancario",
-                            "fecha":       row.fecha,
-                            "descripcion": f"{comp} {desc}".strip(),
-                            "monto":       monto,
-                            "tipo":        "DÉBITO",
-                            "dist_target": dist,
-                        })
+                    desc = getattr(row, "descripcion", "")
+                    comp = getattr(row, "comprobante", "")
+                    for monto, col in [(row.debito, "DÉBITO"), (row.credito, "CRÉDITO")]:
+                        if monto < 1000: continue
+                        dist = abs(monto - target)
+                        if dist <= tol_dif and not _tiene_par(monto, ext_montos):
+                            candidatos.append({
+                                "origen":      f"{col} en auxiliar sin respaldo en extracto bancario",
+                                "fecha":       row.fecha,
+                                "descripcion": f"{comp} {desc}".strip(),
+                                "monto":       monto,
+                                "tipo":        col,
+                                "dist_target": dist,
+                            })
             else:
                 # Buscar CRÉDITO (abono) en extracto sin par en auxiliar
                 candidatos = []
