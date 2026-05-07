@@ -3,5 +3,5 @@ pandas>=2.0
 numpy>=1.26
 openpyxl>=3.1
 Pillow>=10.0
-pdfplumber>=0.10,<0.12
 pymupdf>=1.24
+pytesseract>=0.3.10

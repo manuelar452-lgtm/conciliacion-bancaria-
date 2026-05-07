@@ -1,22 +1,26 @@
 from __future__ import annotations
 import os
 import re
+import shutil
 import tempfile
 import numpy as np
 import pandas as pd
 from datetime import date, datetime, timedelta
-import fitz                 # PyMuPDF — extrae texto e imágenes sin binarios del sistema
-try:
-    import pdfplumber
-    _HAS_PDFPLUMBER = True
-except Exception:
-    _HAS_PDFPLUMBER = False
+import fitz          # PyMuPDF: renderiza PDF→imagen sin poppler
+import pytesseract   # OCR sobre esas imágenes
+from PIL import Image
+import io
+
+# Buscar tesseract en paths comunes del sistema
+for _p in ("/usr/bin/tesseract", "/usr/local/bin/tesseract"):
+    if os.path.isfile(_p):
+        pytesseract.pytesseract.tesseract_cmd = _p
+        break
+
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from PIL import Image
-import io
 
 st.set_page_config(
     page_title="Conciliación Bancaria",
@@ -261,54 +265,80 @@ if st.button("Generar conciliación", type="primary"):
                                 return v
             return None
 
-        def _fitz_page_lines(page):
-            """Extrae líneas (x, word) de una página fitz. No necesita binarios."""
-            words = page.get_text("words")  # (x0,y0,x1,y1,text,block,line,idx)
-            w = page.rect.width
-            if not words:
-                return [], w
+        def _fitz_render_page(fitz_page, dpi=150):
+            """Renderiza una página fitz como imagen PIL (sin poppler)."""
+            zoom = dpi / 72
+            mat  = fitz.Matrix(zoom, zoom)
+            pix  = fitz_page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+            return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        def _ocr_page(fitz_page, dpi=150):
+            """OCR sobre una página: renderiza con fitz, lee con tesseract."""
+            img   = _fitz_render_page(fitz_page, dpi=dpi)
+            data  = pytesseract.image_to_data(
+                img, config="--psm 6",
+                output_type=pytesseract.Output.DATAFRAME
+            )
+            data  = data[data.conf > 0].dropna(subset=["text"]).copy()
+            data["text"] = data["text"].astype(str).str.strip()
+            data  = data[data["text"] != ""].sort_values(["top", "left"])
             lines, cur, cur_y = [], [], None
-            for x0, y0, x1, y1, word, *_ in sorted(words, key=lambda r: (round(r[1],1), r[0])):
-                if cur_y is None or abs(y0 - cur_y) <= 4:
-                    cur.append((x0, word))
-                    if cur_y is None: cur_y = y0
+            for _, row in data.iterrows():
+                if cur_y is None or abs(row["top"] - cur_y) <= 12:
+                    cur.append((row["left"], row["text"]))
+                    cur_y = cur_y or row["top"]
                 else:
                     if cur: lines.append(sorted(cur))
-                    cur, cur_y = [(x0, word)], y0
+                    cur, cur_y = [(row["left"], row["text"])], row["top"]
             if cur: lines.append(sorted(cur))
-            return lines, w
+            return lines, img.width
 
         def parse_extracto(ano, mes):
-            all_rows = []
-            filas_por_pagina = []
-            debug_sample = []
+            all_rows, filas = [], []
+            debug = []
             try:
                 doc = fitz.open(pdf_ext_path)
-                n = len(doc)
+                n   = len(doc)
                 for pg, page in enumerate(doc, 1):
-                    lines, w = _fitz_page_lines(page)
+                    # Intentar texto directo primero (PDFs digitales)
+                    words = page.get_text("words")
+                    if words:
+                        w = page.rect.width
+                        lines, cur, cur_y = [], [], None
+                        for x0,y0,x1,y1,word,*_ in sorted(words, key=lambda r:(round(r[1],1),r[0])):
+                            if cur_y is None or abs(y0-cur_y)<=4:
+                                cur.append((x0,word)); cur_y = cur_y or y0
+                            else:
+                                if cur: lines.append(sorted(cur))
+                                cur, cur_y = [(x0,word)], y0
+                        if cur: lines.append(sorted(cur))
+                        modo = "fitz"
+                    else:
+                        # PDF escaneado → OCR
+                        lines, w = _ocr_page(page, dpi=200)
+                        modo = "ocr"
                     if pg == 1:
                         raw = page.get_text("text") or ""
-                        debug_sample = [
-                            f"Motor: PyMuPDF | Páginas: {n} | Palabras p1: {len(page.get_text('words'))} | Ancho: {round(w,1)}",
-                            f"Texto raw p1: {raw[:300]!r}",
-                        ] + [" | ".join(t for _, t in ln) for ln in lines[:8]]
-                    page_rows = _parse_extracto_page(lines, w)
-                    filas_por_pagina.append((pg, len(page_rows), "fitz"))
-                    all_rows.extend(page_rows)
+                        debug = [
+                            f"Págs:{n} | Palabras p1:{len(words)} | Motor:{modo}",
+                            f"Raw p1: {raw[:200]!r}",
+                        ] + [" | ".join(t for _,t in ln) for ln in lines[:6]]
+                    rows = _parse_extracto_page(lines, w)
+                    filas.append((pg, len(rows), modo))
+                    all_rows.extend(rows)
                 doc.close()
             except Exception as e:
-                debug_sample = [f"ERROR fitz: {e}"]
+                debug = [f"ERROR: {e}"]
 
-            st.session_state["plumber_sample"] = debug_sample
-            st.session_state["ext_debug"]      = filas_por_pagina
+            st.session_state["plumber_sample"] = debug
+            st.session_state["ext_debug"]      = filas
 
             if not all_rows:
                 return pd.DataFrame(), None
             df = pd.DataFrame(all_rows)
             def _make_date(row):
                 m = int(row["mes"]) if pd.notna(row.get("mes")) and row.get("mes") else mes
-                max_day = 28 if m == 2 else 30 if m in [4,6,9,11] else 31
+                max_day = 28 if m==2 else 30 if m in [4,6,9,11] else 31
                 return date(ano, m, min(int(row["dia"]), max_day))
             df["fecha"] = df.apply(_make_date, axis=1)
             return df.sort_values("fecha").reset_index(drop=True), None
@@ -467,7 +497,19 @@ if st.button("Generar conciliación", type="primary"):
             try:
                 doc = fitz.open(pdf_aux_path)
                 for pg, page in enumerate(doc, 1):
-                    lines, w = _fitz_page_lines(page)
+                    words = page.get_text("words")
+                    if words:
+                        w = page.rect.width
+                        lines, cur, cur_y = [], [], None
+                        for x0,y0,x1,y1,word,*_ in sorted(words, key=lambda r:(round(r[1],1),r[0])):
+                            if cur_y is None or abs(y0-cur_y)<=4:
+                                cur.append((x0,word)); cur_y = cur_y or y0
+                            else:
+                                if cur: lines.append(sorted(cur))
+                                cur, cur_y = [(x0,word)], y0
+                        if cur: lines.append(sorted(cur))
+                    else:
+                        lines, w = _ocr_page(page, dpi=200)
                     if pg == 1:
                         aux_sample = [" | ".join(t for _, t in ln) for ln in lines[:8]]
                     df_p = _parse_informe_fitz(lines, w)
@@ -475,7 +517,7 @@ if st.button("Generar conciliación", type="primary"):
                         all_rows.append(df_p)
                 doc.close()
             except Exception as e:
-                aux_sample = [f"ERROR fitz: {e}"]
+                aux_sample = [f"ERROR: {e}"]
 
             st.session_state["aux_sample"] = aux_sample
             if not all_rows:
