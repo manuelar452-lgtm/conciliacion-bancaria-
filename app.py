@@ -159,17 +159,31 @@ if st.button("Generar conciliación", type="primary"):
             for line in lines:
                 if not line: continue
 
-                # ── Detectar fecha (primeros tokens, zona flexible hasta 25%) ───
+                # ── Detectar fecha (primeros tokens, zona flexible hasta 40%) ───
                 day, mon = None, None
                 for tok_x, tok_t in line:
-                    if tok_x >= w * 0.25:
+                    if tok_x >= w * 0.40:
                         break
                     tc = _clean(tok_t)
-                    m = re.match(r"^(\d{1,2})[/\-](\d{2})$", tc)
+                    # DD/MM/YYYY o DD-MM-YYYY (fecha completa)
+                    m = re.match(r"^(\d{1,2})[/\-](\d{2})[/\-]\d{2,4}$", tc)
                     if m:
                         d, mo = int(m.group(1)), int(m.group(2))
                         if 1 <= d <= 31 and 1 <= mo <= 12:
                             day, mon = d, mo; break
+                    # YYYY/MM/DD o YYYY-MM-DD
+                    m2 = re.match(r"^\d{4}[/\-](\d{2})[/\-](\d{1,2})$", tc)
+                    if m2:
+                        mo, d = int(m2.group(1)), int(m2.group(2))
+                        if 1 <= d <= 31 and 1 <= mo <= 12:
+                            day, mon = d, mo; break
+                    # DD/MM (sin año)
+                    m3 = re.match(r"^(\d{1,2})[/\-](\d{2})$", tc)
+                    if m3:
+                        d, mo = int(m3.group(1)), int(m3.group(2))
+                        if 1 <= d <= 31 and 1 <= mo <= 12:
+                            day, mon = d, mo; break
+                    # Solo día: DD
                     if re.match(r"^\d{1,2}$", tc):
                         d = int(tc)
                         if 1 <= d <= 31:
@@ -309,6 +323,17 @@ if st.button("Generar conciliación", type="primary"):
             if cur: lines.append(sorted(cur))
             return lines, img.width
 
+        def _build_fitz_lines(words, tol=4):
+            lines, cur, cur_y = [], [], None
+            for x0,y0,x1,y1,word,*_ in sorted(words, key=lambda r:(round(r[1],1),r[0])):
+                if cur_y is None or abs(y0-cur_y) <= tol:
+                    cur.append((x0,word)); cur_y = cur_y or y0
+                else:
+                    if cur: lines.append(sorted(cur))
+                    cur, cur_y = [(x0,word)], y0
+            if cur: lines.append(sorted(cur))
+            return lines
+
         def parse_extracto(ano, mes):
             all_rows, filas = [], []
             debug = []
@@ -316,30 +341,32 @@ if st.button("Generar conciliación", type="primary"):
                 doc = fitz.open(pdf_ext_path)
                 n   = len(doc)
                 for pg, page in enumerate(doc, 1):
-                    # Intentar texto directo primero (PDFs digitales)
                     words = page.get_text("words")
-                    if words:
-                        w = page.rect.width
-                        lines, cur, cur_y = [], [], None
-                        for x0,y0,x1,y1,word,*_ in sorted(words, key=lambda r:(round(r[1],1),r[0])):
-                            if cur_y is None or abs(y0-cur_y)<=4:
-                                cur.append((x0,word)); cur_y = cur_y or y0
-                            else:
-                                if cur: lines.append(sorted(cur))
-                                cur, cur_y = [(x0,word)], y0
-                        if cur: lines.append(sorted(cur))
-                        modo = "fitz"
+                    w     = page.rect.width
+                    modo  = "?"
+
+                    # Intentar texto directo solo si hay suficientes palabras (no es pura imagen)
+                    if len(words) > 80:
+                        lines = _build_fitz_lines(words)
+                        rows  = _parse_extracto_page(lines, w)
+                        modo  = "fitz"
+                        # Si fitz no produjo filas, el texto embebido es basura → usar OCR
+                        if not rows:
+                            lines, w = _ocr_page(page, dpi=300)
+                            rows  = _parse_extracto_page(lines, w)
+                            modo  = "fitz→ocr"
                     else:
-                        # PDF escaneado → OCR
-                        lines, w = _ocr_page(page, dpi=200)
-                        modo = "ocr"
+                        # Pocos o nulos palabras → PDF escaneado puro → OCR directo
+                        lines, w = _ocr_page(page, dpi=300)
+                        rows  = _parse_extracto_page(lines, w)
+                        modo  = "ocr"
+
                     if pg == 1:
                         raw = page.get_text("text") or ""
                         debug = [
                             f"Págs:{n} | Palabras p1:{len(words)} | Motor:{modo}",
-                            f"Raw p1: {raw[:200]!r}",
-                        ] + [" | ".join(t for _,t in ln) for ln in lines[:6]]
-                    rows = _parse_extracto_page(lines, w)
+                            f"Raw p1: {raw[:300]!r}",
+                        ] + [" | ".join(t for _,t in ln) for ln in lines[:8]]
                     filas.append((pg, len(rows), modo))
                     all_rows.extend(rows)
                 doc.close()
@@ -597,10 +624,14 @@ if st.button("Generar conciliación", type="primary"):
             )
 
             all_rows = []
-            for lines, w in all_pages:
+            rows_per_page = []
+            for pg_i, (lines, w) in enumerate(all_pages, 1):
                 df_p = _parse_informe_fitz(lines, w, col_split=col_split)
+                rows_per_page.append((pg_i, len(df_p)))
                 if not df_p.empty:
                     all_rows.append(df_p)
+
+            st.session_state["aux_rows_per_page"] = rows_per_page
 
             if not all_rows:
                 return pd.DataFrame(
@@ -1001,12 +1032,17 @@ if st.button("Generar conciliación", type="primary"):
             st.warning("pdfplumber no extrajo filas del extracto — ver texto de debug abajo.")
         debug = st.session_state.get("ext_debug", [])
         if debug:
-            modo = debug[0][2] if debug else "?"
-            st.caption(f"Modo: {'pdfplumber ✓' if modo=='pdf' else 'OCR'} — "
-                       "Filas/página: " + " | ".join(f"P{p}:{n}" for p, n, _ in debug))
+            total_ext = sum(n for _,n,_ in debug)
+            pages_zero = [p for p,n,_ in debug if n == 0]
+            st.caption(
+                f"**Total filas extracto: {total_ext}** — "
+                + " | ".join(f"P{p}:{n}({m})" for p,n,m in debug)
+            )
+            if pages_zero:
+                st.warning(f"⚠️ Páginas sin filas: {pages_zero} — el OCR no pudo leer esas páginas")
         sample = st.session_state.get("plumber_sample", [])
         if sample:
-            st.caption("**Texto que leyó pdfplumber del extracto (pág 1) — cópiame esto:**")
+            st.caption("**Texto crudo del extracto (pág 1) — cópiame esto:**")
             for ln in sample:
                 st.code(ln)
 
@@ -1021,6 +1057,13 @@ if st.button("Generar conciliación", type="primary"):
             st.caption("**Texto que leyó pdfplumber del auxiliar (pág 1) — cópiame esto:**")
             for ln in aux_sample:
                 st.code(ln)
+        aux_rpp = st.session_state.get("aux_rows_per_page", [])
+        if aux_rpp:
+            total_aux = sum(n for _,n in aux_rpp)
+            st.caption(
+                f"**Total filas auxiliar: {total_aux}** — "
+                + " | ".join(f"P{p}:{n}" for p,n in aux_rpp)
+            )
         col_split_dbg = st.session_state.get("col_split_debug", "")
         if col_split_dbg:
             st.caption(f"Detección columnas: `{col_split_dbg}`")
