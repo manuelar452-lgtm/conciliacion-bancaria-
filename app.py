@@ -265,6 +265,39 @@ if st.button("Generar conciliación", type="primary"):
                                 return v
             return None
 
+        def _find_saldo_fitz(pdf_path: str) -> float | None:
+            """OCR las últimas páginas del PDF para encontrar el Saldo Final."""
+            try:
+                doc = fitz.open(pdf_path)
+                n_pages = len(doc)
+                for pg_idx in range(n_pages - 1, max(n_pages - 4, -1), -1):
+                    page = doc[pg_idx]
+                    img  = _fitz_render_page(page, dpi=200)
+                    text = pytesseract.image_to_string(img, config="--psm 6")
+                    for line in text.split("\n"):
+                        if re.search(
+                            r"saldo\s*(final|al\s*corte|bancario|disponible)",
+                            line, re.IGNORECASE
+                        ):
+                            # Extraer todos los números de la línea (con o sin decimal)
+                            nums = re.findall(r"[\d]{1,3}(?:[,.\s]\d{3})+(?:[,.]\d{2})?|\d{6,}", line)
+                            for n_str in reversed(nums):
+                                # Normalizar: quitar separadores de miles, manejar decimal
+                                cleaned = re.sub(r"[,.\s](?=\d{3}(?:[,.\s]|$))", "", n_str)
+                                # Intentar con coma como decimal también
+                                cleaned = re.sub(r",(\d{2})$", r".\1", cleaned)
+                                try:
+                                    v = float(cleaned.replace(",", "").replace(" ", ""))
+                                    if v > 100_000:
+                                        doc.close()
+                                        return v
+                                except Exception:
+                                    pass
+                doc.close()
+            except Exception:
+                pass
+            return None
+
         def _fitz_render_page(fitz_page, dpi=150):
             """Renderiza una página fitz como imagen PIL (sin poppler)."""
             zoom = dpi / 72
@@ -848,27 +881,17 @@ if st.button("Generar conciliación", type="primary"):
             else:
                 ano, mes = date.today().year, date.today().month
 
-        # Procesar extracto — pdfplumber lee texto directo, sin OCR
+        # Procesar extracto
         df_ext, _images_ext = parse_extracto(ano, mes)
-        _ext_saldos = df_ext["saldo"].dropna() if not df_ext.empty else pd.Series(dtype=float)
-        saldo_ext = float(_ext_saldos.iloc[-1]) if not _ext_saldos.empty else None
 
-        # Si pdfplumber no encontró saldo, intentar buscar en texto del PDF
+        # 1) Buscar "Saldo Final" en OCR de últimas páginas (más confiable)
+        saldo_ext = _find_saldo_fitz(pdf_ext_path)
+
+        # 2) Fallback: saldo máximo de la tabla OCR (el saldo corriente crece hasta el final)
         if saldo_ext is None and not df_ext.empty:
-            try:
-                with pdfplumber.open(pdf_ext_path) as pdf:
-                    for page in reversed(pdf.pages):
-                        txt = page.extract_text() or ""
-                        for line in txt.split("\n"):
-                            if re.search(r"saldo\s+(final|al\s+corte|bancario)", line, re.IGNORECASE):
-                                nums = re.findall(r"[\d,]+\.\d{2}", line)
-                                for n in nums:
-                                    v = _to_float(n)
-                                    if v and v > 0:
-                                        saldo_ext = v; break
-                        if saldo_ext: break
-            except Exception:
-                pass
+            _ext_saldos = df_ext["saldo"].dropna()
+            if not _ext_saldos.empty:
+                saldo_ext = float(_ext_saldos.max())
 
         # Procesar auxiliar — pdfplumber lee texto directo, sin OCR
         df_inf, _images_aux = parse_auxiliar()
