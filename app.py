@@ -618,16 +618,14 @@ if st.button("Generar conciliación", type="primary"):
 
         def _buscar_partida(df_ext, df_inf, diferencia_saldos):
             """
-            Busca en AMBAS direcciones (extracto vs auxiliar y auxiliar vs extracto)
-            el movimiento cuyo monto es más cercano a la diferencia de saldos y
-            no tiene contraparte en el otro documento.
+            Busca en el EXTRACTO el movimiento más cercano a la diferencia que
+            no aparece en el auxiliar. Solo si no se encuentra allí, busca al revés.
             """
             if df_ext.empty or df_inf.empty:
                 return None
 
             target  = abs(diferencia_saldos)
-            # Tolerancia amplia: hasta 30 % del target o mín $10.000
-            tol_dif = max(target * 0.30, 10_000)
+            tol_dif = max(target * 0.15, 5_000)   # ±15 % del target
 
             def _montos(df):
                 out = []
@@ -636,52 +634,57 @@ if st.button("Generar conciliación", type="primary"):
                     if r.credito > 0: out.append(round(r.credito / 100) * 100)
                 return out
 
-            ext_montos = _montos(df_ext)
             aux_montos = _montos(df_inf)
+            ext_montos = _montos(df_ext)
 
-            def _tiene_par(monto, lista, tol_pct=0.02):
-                tol = max(round(monto * tol_pct / 100) * 100, 1000)
+            def _tiene_par(monto, lista):
+                tol = max(round(monto * 0.02 / 100) * 100, 1000)
                 bucket = round(monto / 100) * 100
                 return any(abs(a - bucket) <= tol for a in lista)
 
-            candidatos = []
-
-            # Dirección 1: en extracto pero NO en auxiliar
+            # 1) Buscar en extracto lo que NO está en auxiliar, cercano al target
+            cand_ext = []
             for _, row in df_ext.iterrows():
                 for monto in [row.debito, row.credito]:
                     if monto < 1000: continue
-                    if not _tiene_par(monto, aux_montos):
-                        candidatos.append({
+                    dist = abs(monto - target)
+                    if dist <= tol_dif and not _tiene_par(monto, aux_montos):
+                        cand_ext.append({
                             "origen":      "en extracto, falta en auxiliar",
                             "fecha":       row.fecha,
                             "descripcion": row.descripcion,
                             "monto":       monto,
                             "tipo":        "CARGO" if monto == row.debito else "ABONO",
-                            "dist_target": abs(monto - target),
+                            "dist_target": dist,
                         })
 
-            # Dirección 2: en auxiliar pero NO en extracto
+            if cand_ext:
+                cand_ext.sort(key=lambda x: x["dist_target"])
+                return cand_ext[0]
+
+            # 2) Si no encontró nada en extracto, buscar en auxiliar lo que falta en extracto
+            cand_aux = []
             for _, row in df_inf.iterrows():
                 for monto in [row.debito, row.credito]:
                     if monto < 1000: continue
-                    if not _tiene_par(monto, ext_montos):
+                    dist = abs(monto - target)
+                    if dist <= tol_dif and not _tiene_par(monto, ext_montos):
                         desc = getattr(row, "descripcion", "")
                         comp = getattr(row, "comprobante", "")
-                        candidatos.append({
+                        cand_aux.append({
                             "origen":      "en auxiliar, falta en extracto",
                             "fecha":       row.fecha,
                             "descripcion": f"{comp} {desc}".strip(),
                             "monto":       monto,
                             "tipo":        "DÉBITO" if monto == row.debito else "CRÉDITO",
-                            "dist_target": abs(monto - target),
+                            "dist_target": dist,
                         })
 
-            if not candidatos:
-                return None
+            if cand_aux:
+                cand_aux.sort(key=lambda x: x["dist_target"])
+                return cand_aux[0]
 
-            candidatos.sort(key=lambda x: x["dist_target"])
-            cerca = [c for c in candidatos if c["dist_target"] <= tol_dif]
-            return cerca[0] if cerca else candidatos[0]
+            return None
 
         # ── Excel output ──────────────────────────────────────────────────────
         _HDR  = PatternFill("solid", fgColor="1F3864")
@@ -789,16 +792,19 @@ if st.button("Generar conciliación", type="primary"):
                 _kv(ws, 12, "Tipo",        partida_faltante["tipo"],             _YELL)
                 _kv(ws, 13, "Origen",      partida_faltante["origen"],           _YELL)
 
-            # Hoja Extracto
+            # Hoja Extracto — última fila usa saldo_ext oficial
             ws2 = wb.create_sheet("Extracto")
             for col, cw in zip("ABCDEF",[12,8,45,22,22,26]): ws2.column_dimensions[col].width = cw
             _hrow(ws2, 1, ["Fecha","Día","Descripción","Débito","Crédito","Saldo"])
-            for i,(_, row) in enumerate(df_ext.iterrows(), 2):
+            ext_rows = list(df_ext.iterrows())
+            for i, (_, row) in enumerate(ext_rows, 2):
                 fill = _GRN if i%2==0 else _GREY
+                es_ultima = (i == len(ext_rows) + 1)
+                saldo_fila = saldo_ext if (es_ultima and saldo_ext) else row.saldo
                 _drow(ws2, i, [str(row.fecha), row.dia, row.descripcion,
                     _fmt_cop(row.debito) if row.debito>0 else "",
                     _fmt_cop(row.credito) if row.credito>0 else "",
-                    _fmt_cop(row.saldo)], fill)
+                    _fmt_cop(saldo_fila)], fill)
 
             # Hoja Auxiliar
             ws3 = wb.create_sheet("Auxiliar")
