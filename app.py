@@ -642,49 +642,47 @@ if st.button("Generar conciliación", type="primary"):
                 bucket = round(monto / 100) * 100
                 return any(abs(a - bucket) <= tol for a in lista)
 
-            # 1) Buscar en extracto lo que NO está en auxiliar, cercano al target
-            cand_ext = []
-            for _, row in df_ext.iterrows():
-                for monto in [row.debito, row.credito]:
-                    if monto < 1000: continue
-                    dist = abs(monto - target)
-                    if dist <= tol_dif and not _tiene_par(monto, aux_montos):
-                        cand_ext.append({
-                            "origen":      "en extracto, falta en auxiliar",
-                            "fecha":       row.fecha,
-                            "descripcion": row.descripcion,
-                            "monto":       monto,
-                            "tipo":        "CARGO" if monto == row.debito else "ABONO",
-                            "dist_target": dist,
-                        })
+            # Banco < Contabilidad → el auxiliar tiene algo de más → buscar en auxiliar
+            # Banco > Contabilidad → al auxiliar le falta algo → buscar en extracto
+            if diferencia_saldos < 0:
+                # Buscar en AUXILIAR lo que NO está en el extracto
+                candidatos = []
+                for _, row in df_inf.iterrows():
+                    for monto in [row.debito, row.credito]:
+                        if monto < 1000: continue
+                        dist = abs(monto - target)
+                        if dist <= tol_dif and not _tiene_par(monto, ext_montos):
+                            desc = getattr(row, "descripcion", "")
+                            comp = getattr(row, "comprobante", "")
+                            candidatos.append({
+                                "origen":      "registrado en auxiliar, no aparece en extracto bancario",
+                                "fecha":       row.fecha,
+                                "descripcion": f"{comp} {desc}".strip(),
+                                "monto":       monto,
+                                "tipo":        "DÉBITO" if monto == row.debito else "CRÉDITO",
+                                "dist_target": dist,
+                            })
+            else:
+                # Buscar en EXTRACTO lo que NO está en el auxiliar
+                candidatos = []
+                for _, row in df_ext.iterrows():
+                    for monto in [row.debito, row.credito]:
+                        if monto < 1000: continue
+                        dist = abs(monto - target)
+                        if dist <= tol_dif and not _tiene_par(monto, aux_montos):
+                            candidatos.append({
+                                "origen":      "registrado en extracto bancario, no aparece en auxiliar",
+                                "fecha":       row.fecha,
+                                "descripcion": row.descripcion,
+                                "monto":       monto,
+                                "tipo":        "CARGO" if monto == row.debito else "ABONO",
+                                "dist_target": dist,
+                            })
 
-            if cand_ext:
-                cand_ext.sort(key=lambda x: x["dist_target"])
-                return cand_ext[0]
-
-            # 2) Si no encontró nada en extracto, buscar en auxiliar lo que falta en extracto
-            cand_aux = []
-            for _, row in df_inf.iterrows():
-                for monto in [row.debito, row.credito]:
-                    if monto < 1000: continue
-                    dist = abs(monto - target)
-                    if dist <= tol_dif and not _tiene_par(monto, ext_montos):
-                        desc = getattr(row, "descripcion", "")
-                        comp = getattr(row, "comprobante", "")
-                        cand_aux.append({
-                            "origen":      "en auxiliar, falta en extracto",
-                            "fecha":       row.fecha,
-                            "descripcion": f"{comp} {desc}".strip(),
-                            "monto":       monto,
-                            "tipo":        "DÉBITO" if monto == row.debito else "CRÉDITO",
-                            "dist_target": dist,
-                        })
-
-            if cand_aux:
-                cand_aux.sort(key=lambda x: x["dist_target"])
-                return cand_aux[0]
-
-            return None
+            if not candidatos:
+                return None
+            candidatos.sort(key=lambda x: x["dist_target"])
+            return candidatos[0]
 
         # ── Excel output ──────────────────────────────────────────────────────
         _HDR  = PatternFill("solid", fgColor="1F3864")
