@@ -662,49 +662,52 @@ if st.button("Generar conciliación", type="primary"):
                 return False
 
             if diferencia_saldos < 0:
-                # Banco < Contabilidad: auxiliar tiene algo que el banco no tiene.
-                # Recorremos el auxiliar intentando consumir pares del extracto.
-                # Lo que no consigue par → partida sobrante en auxiliar.
+                # Banco < Contabilidad: el auxiliar tiene un DÉBITO extra que el banco no tiene.
+                # Un DÉBITO en auxiliar = entrada/ingreso registrado en contabilidad
+                # que inflà el saldo contable. Si el banco no lo tiene, el banco queda menor.
+                # (Un CRÉDITO extra en auxiliar haría lo opuesto: bajaría el saldo contable.)
                 ext_pool   = _build_pool(df_ext)
                 candidatos = []
                 for _, row in df_inf.iterrows():
                     desc = getattr(row, "descripcion", "")
                     comp = getattr(row, "comprobante", "")
-                    for monto, col in [(row.debito, "DÉBITO"), (row.credito, "CRÉDITO")]:
-                        if monto < 1_000: continue
-                        if _consume(ext_pool, monto):
-                            pass  # tiene par en el banco → ok
-                        else:
-                            dist = abs(monto - target)
-                            if dist <= tol_dif:
-                                candidatos.append({
-                                    "origen":      f"{col} en auxiliar sin respaldo en extracto bancario",
-                                    "fecha":       row.fecha,
-                                    "descripcion": f"{comp} {desc}".strip(),
-                                    "monto":       monto,
-                                    "tipo":        col,
-                                    "dist_target": dist,
-                                })
+                    monto = row.debito          # solo DÉBITO en auxiliar
+                    if monto < 1_000: continue
+                    if _consume(ext_pool, monto):
+                        pass  # tiene par en el banco → ok
+                    else:
+                        dist = abs(monto - target)
+                        if dist <= tol_dif:
+                            candidatos.append({
+                                "origen":      "DÉBITO en auxiliar sin respaldo en extracto bancario",
+                                "fecha":       row.fecha,
+                                "descripcion": f"{comp} {desc}".strip(),
+                                "monto":       monto,
+                                "tipo":        "DÉBITO",
+                                "dist_target": dist,
+                            })
             else:
-                # Banco > Contabilidad: extracto tiene algo que el auxiliar no tiene.
+                # Banco > Contabilidad: el extracto tiene un CRÉDITO extra que el auxiliar no tiene.
+                # Un CRÉDITO en extracto = depósito/ingreso en el banco que contabilidad no registró,
+                # lo que infla el saldo bancario.
                 aux_pool   = _build_pool(df_inf)
                 candidatos = []
                 for _, row in df_ext.iterrows():
-                    for monto, col in [(row.debito, "DÉBITO"), (row.credito, "CRÉDITO")]:
-                        if monto < 1_000: continue
-                        if _consume(aux_pool, monto):
-                            pass
-                        else:
-                            dist = abs(monto - target)
-                            if dist <= tol_dif:
-                                candidatos.append({
-                                    "origen":      f"{col} en extracto bancario sin registrar en auxiliar",
-                                    "fecha":       row.fecha,
-                                    "descripcion": row.descripcion,
-                                    "monto":       monto,
-                                    "tipo":        col,
-                                    "dist_target": dist,
-                                })
+                    monto = row.credito         # solo CRÉDITO en extracto
+                    if monto < 1_000: continue
+                    if _consume(aux_pool, monto):
+                        pass
+                    else:
+                        dist = abs(monto - target)
+                        if dist <= tol_dif:
+                            candidatos.append({
+                                "origen":      "CRÉDITO en extracto bancario sin registrar en auxiliar",
+                                "fecha":       row.fecha,
+                                "descripcion": row.descripcion,
+                                "monto":       monto,
+                                "tipo":        "CRÉDITO",
+                                "dist_target": dist,
+                            })
 
             if not candidatos:
                 return None
