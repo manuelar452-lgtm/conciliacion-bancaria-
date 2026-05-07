@@ -140,8 +140,9 @@ if st.button("Generar conciliación", type="primary"):
             return bool(
                 re.match(r"^-?\d{1,3}(,\d{3})+(\.\d{1,2})?$", t) or   # US: 1,334,847.00
                 re.match(r"^-?\d{4,}\.\d{2}$",                  t) or   # sin comas: 1334847.00
-                re.match(r"^-?\d{1,3}(\.\d{3})+(,\d{1,2})?$",  t) or   # EUR: 1.334.847,00
-                re.match(r"^-?\d{6,}$",                          t)      # entero sin formato
+                re.match(r"^-?\d{1,3}(\.\d{3})+(,\d{1,2})?$",  t) or   # EUR/COL: 1.334.847,00
+                re.match(r"^-?\d{6,}$",                          t) or   # entero sin formato ≥6 dígitos
+                re.match(r"^-?\d{1,9},\d{2}$",                  t)       # COL sin miles: 500,00 / 12345,67
             )
 
         def _to_float(text: str):
@@ -506,7 +507,7 @@ if st.button("Generar conciliación", type="primary"):
 
             rows = []
             for line in lines:
-                comprobante = next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None)
+                comprobante = next((t for _, t in line if _COMP_RE.match(t)), None)
                 if not comprobante: continue
                 fecha_str = next((t for _, t in line if re.match(r"^\d{4}/\d{2}/\d{2}$", t)), None)
                 if not fecha_str: continue
@@ -556,51 +557,52 @@ if st.button("Generar conciliación", type="primary"):
             return pd.DataFrame(rows) if rows else pd.DataFrame(
                 columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
 
+        _COMP_RE = re.compile(r"^[A-Z]{1,3}-\d")   # comprobante: 1-3 letras, guión, dígito
+
         def parse_auxiliar():
             """
-            Parsea auxiliar con PyMuPDF.
-            Estrategia de columnas: busca la fila de encabezado con 'DÉBITO' y 'CRÉDITO'
-            para obtener las posiciones X exactas. Es más fiable que análisis estadístico
-            porque usa la estructura real del documento.
+            Parsea auxiliar con PyMuPDF + fallback OCR (igual que extracto).
+            Si fitz extrae palabras pero ninguna línea tiene comprobante, reintenta con OCR.
             """
-            all_pages = []   # (lines, w) por página
+            all_pages = []   # (lines, w, modo) por página
             aux_sample = []
-
-            def _build_lines(words, w):
-                lines, cur, cur_y = [], [], None
-                for x0,y0,x1,y1,word,*_ in sorted(words, key=lambda r:(round(r[1],1),r[0])):
-                    if cur_y is None or abs(y0-cur_y) <= 5:
-                        cur.append((x0, word)); cur_y = cur_y or y0
-                    else:
-                        if cur: lines.append(sorted(cur))
-                        cur, cur_y = [(x0, word)], y0
-                if cur: lines.append(sorted(cur))
-                return lines
+            x0_deb = x0_cred = None
 
             try:
                 doc = fitz.open(pdf_aux_path)
-                x0_deb = x0_cred = None   # posiciones X de encabezados de columna
 
                 for pg, page in enumerate(doc, 1):
                     words = page.get_text("words")
-                    if words:
-                        w = page.rect.width
-                        lines = _build_lines(words, w)
+                    w     = page.rect.width
+                    modo  = "?"
 
-                        # Detectar fila de encabezado DÉBITOS / CRÉDITOS en este página
-                        if x0_deb is None:
-                            for x0,y0,x1,y1,word,*_ in words:
-                                wu = word.upper()
-                                if re.search(r'D[EÉ]BITO', wu) and x0 > w * 0.30:
-                                    x0_deb = x0
-                                elif re.search(r'CR[EÉ]DITO', wu) and x0 > w * 0.30:
-                                    x0_cred = x0
+                    if len(words) > 80:
+                        lines_fitz = _build_fitz_lines(words, tol=5)
+                        # Verificar si fitz produjo algo útil (alguna línea con comprobante)
+                        has_comp = any(
+                            any(_COMP_RE.match(t) for _, t in ln)
+                            for ln in lines_fitz
+                        )
+                        if has_comp:
+                            lines = lines_fitz
+                            modo  = "fitz"
+                            # Detectar encabezados DÉBITO/CRÉDITO
+                            for _x0,_y0,_x1,_y1,wrd,*_ in words:
+                                wu = wrd.upper()
+                                if x0_deb is None and re.search(r'D[EÉ]BITO', wu) and _x0 > w*0.30:
+                                    x0_deb = _x0
+                                if x0_cred is None and re.search(r'CR[EÉ]DITO', wu) and _x0 > w*0.30:
+                                    x0_cred = _x0
+                        else:
+                            lines, w = _ocr_page(page, dpi=300)
+                            modo = "fitz→ocr"
                     else:
-                        lines, w = _ocr_page(page, dpi=200)
+                        lines, w = _ocr_page(page, dpi=300)
+                        modo = "ocr"
 
                     if pg == 1:
                         aux_sample = [" | ".join(t for _, t in ln) for ln in lines[:8]]
-                    all_pages.append((lines, w))
+                    all_pages.append((lines, w, modo))
 
                 doc.close()
             except Exception as e:
@@ -611,23 +613,19 @@ if st.button("Generar conciliación", type="primary"):
                 return pd.DataFrame(
                     columns=["comprobante","fecha","descripcion","debito","credito","saldo"]), None
 
-            # Calcular col_split a partir de los encabezados detectados
-            # Usamos borde derecho estimado de cada label para mayor precisión
             col_split = None
             if x0_deb is not None and x0_cred is not None:
-                def _xr(x0, t): return x0 + len(t) * 6.5
-                xr_deb  = _xr(x0_deb,  "DÉBITOS")
-                xr_cred = _xr(x0_cred, "CRÉDITOS")
-                col_split = (xr_deb + xr_cred) / 2
+                def _xr_h(x0, t): return x0 + len(t) * 6.5
+                col_split = (_xr_h(x0_deb, "DÉBITOS") + _xr_h(x0_cred, "CRÉDITOS")) / 2
             st.session_state["col_split_debug"] = (
                 f"x0_deb={x0_deb} x0_cred={x0_cred} col_split={col_split}"
             )
 
             all_rows = []
             rows_per_page = []
-            for pg_i, (lines, w) in enumerate(all_pages, 1):
+            for pg_i, (lines, w, modo) in enumerate(all_pages, 1):
                 df_p = _parse_informe_fitz(lines, w, col_split=col_split)
-                rows_per_page.append((pg_i, len(df_p)))
+                rows_per_page.append((pg_i, len(df_p), modo))
                 if not df_p.empty:
                     all_rows.append(df_p)
 
@@ -1059,10 +1057,10 @@ if st.button("Generar conciliación", type="primary"):
                 st.code(ln)
         aux_rpp = st.session_state.get("aux_rows_per_page", [])
         if aux_rpp:
-            total_aux = sum(n for _,n in aux_rpp)
+            total_aux = sum(n for _,n,_ in aux_rpp)
             st.caption(
                 f"**Total filas auxiliar: {total_aux}** — "
-                + " | ".join(f"P{p}:{n}" for p,n in aux_rpp)
+                + " | ".join(f"P{p}:{n}({m})" for p,n,m in aux_rpp)
             )
         col_split_dbg = st.session_state.get("col_split_debug", "")
         if col_split_dbg:
