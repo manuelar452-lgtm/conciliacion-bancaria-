@@ -1,21 +1,10 @@
 from __future__ import annotations
-import os
 import re
-import shutil
-import tempfile
+import io
+import unicodedata
 import numpy as np
 import pandas as pd
 from datetime import date, datetime, timedelta
-import fitz          # PyMuPDF: renderiza PDF→imagen sin poppler
-import pytesseract   # OCR sobre esas imágenes
-from PIL import Image
-import io
-
-# Buscar tesseract en paths comunes del sistema
-for _p in ("/usr/bin/tesseract", "/usr/local/bin/tesseract"):
-    if os.path.isfile(_p):
-        pytesseract.pytesseract.tesseract_cmd = _p
-        break
 
 import streamlit as st
 from openpyxl import Workbook
@@ -29,11 +18,11 @@ st.set_page_config(
 )
 
 col_a, col_b = st.columns(2)
-uploaded_ext = col_a.file_uploader("📄 Extracto bancario (PDF)", type="pdf")
-uploaded_aux = col_b.file_uploader("📒 Auxiliar contabilidad (PDF)", type="pdf")
+uploaded_ext = col_a.file_uploader("📄 Extracto bancario (Excel)", type=["xlsx", "xls"])
+uploaded_aux = col_b.file_uploader("📒 Auxiliar contabilidad (Excel)", type=["xlsx", "xls"])
 
 if not uploaded_ext or not uploaded_aux:
-    st.info("Sube los dos archivos PDF para continuar.")
+    st.info("Sube los dos archivos Excel para continuar.")
     st.stop()
 
 col_a.success(uploaded_ext.name)
@@ -41,661 +30,248 @@ col_b.success(uploaded_aux.name)
 
 if st.button("Generar conciliación", type="primary"):
 
-    with st.spinner("Procesando... (puede tardar 1-2 minutos)"):
-
-        # ── Guardar PDFs temporales ───────────────────────────────────────────
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(uploaded_ext.read())
-            pdf_ext_path = tmp.name
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(uploaded_aux.read())
-            pdf_aux_path = tmp.name
+    with st.spinner("Procesando..."):
 
         # ── Utilidades ────────────────────────────────────────────────────────
-
-        def _parse_num(text):
-            clean = re.sub(r"[^\d.]", "", str(text))
-            try:    return float(clean) if clean else None
-            except: return None
-
-        def _is_currency(text):
-            t = re.sub(r"[\[\|\]]+", "", text).strip()
-            return bool(
-                re.match(r"^-?\d{1,3}(,\d{3})+(\.\d{2})?$", t) or
-                re.match(r"^-?\d{4,}(\.\d{2})?$", t)
-            )
 
         def _fmt_cop(v):
             if v is None or (isinstance(v, float) and np.isnan(v)): return ""
             try:    return f"$ {float(v):>20,.0f}"
             except: return str(v)
 
-        def _plumber_lines(page):
-            """Extrae líneas desde pdfplumber (sin OCR). Retorna (lines, page_width)."""
-            words = page.extract_words(x_tolerance=3, y_tolerance=3,
-                                       keep_blank_chars=False)
-            if not words:
-                return [], page.width
-            lines, cur, cur_y = [], [], None
-            for w in sorted(words, key=lambda w: (round(w["top"], 1), w["x0"])):
-                if cur_y is None or abs(w["top"] - cur_y) <= 4:
-                    cur.append((w["x0"], w["text"]))
-                    if cur_y is None: cur_y = w["top"]
-                else:
-                    if cur: lines.append(sorted(cur))
-                    cur, cur_y = [(w["x0"], w["text"])], w["top"]
-            if cur: lines.append(sorted(cur))
-            return lines, page.width
+        def _to_num(v) -> float:
+            if v is None: return 0.0
+            try:
+                if pd.isna(v): return 0.0
+            except TypeError:
+                pass
+            try:    return float(v)
+            except: return 0.0
 
-        def _fitz_lines(pdf_path, page_num=0):
-            """Extrae líneas de texto de una página usando PyMuPDF (sin binarios del sistema)."""
-            doc = fitz.open(pdf_path)
-            page = doc[page_num]
-            words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,word_idx)
-            doc.close()
-            if not words:
-                return [], page.rect.width
-            w = page.rect.width
-            # Agrupar por Y (tolerancia 4pt)
-            lines, cur, cur_y = [], [], None
-            for x0, y0, x1, y1, word, *_ in sorted(words, key=lambda r: (round(r[1], 1), r[0])):
-                if cur_y is None or abs(y0 - cur_y) <= 4:
-                    cur.append((x0, word))
-                    if cur_y is None: cur_y = y0
-                else:
-                    if cur: lines.append(sorted(cur))
-                    cur, cur_y = [(x0, word)], y0
-            if cur: lines.append(sorted(cur))
-            return lines, w
-
-        def _fitz_all_lines(pdf_path):
-            """Extrae líneas de todas las páginas con PyMuPDF."""
-            doc = fitz.open(pdf_path)
-            all_lines = []
-            widths = []
-            for page in doc:
-                words = page.get_text("words")
-                w = page.rect.width
-                widths.append(w)
-                lines, cur, cur_y = [], [], None
-                for x0, y0, x1, y1, word, *_ in sorted(words, key=lambda r: (round(r[1],1), r[0])):
-                    if cur_y is None or abs(y0 - cur_y) <= 4:
-                        cur.append((x0, word))
-                        if cur_y is None: cur_y = y0
-                    else:
-                        if cur: lines.append(sorted(cur))
-                        cur, cur_y = [(x0, word)], y0
-                if cur: lines.append(sorted(cur))
-                all_lines.append((lines, w))
-            doc.close()
-            return all_lines
-
-        # ── Extracto: parser genérico (Itau, Banco de Bogotá, etc.) ─────────────
-        def _clean(t: str) -> str:
-            """Elimina artefactos OCR como | al inicio/fin."""
-            return re.sub(r"[\[\|\]]+", "", t).strip()
-
-        def _is_amount(text: str) -> bool:
-            t = _clean(text)
-            return bool(
-                re.match(r"^-?\d{1,3}(,\d{3})+(\.\d{1,2})?$", t) or   # US: 1,334,847.00
-                re.match(r"^-?\d{4,}\.\d{2}$",                  t) or   # sin comas: 1334847.00
-                re.match(r"^-?\d{1,3}(\.\d{3})+(,\d{1,2})?$",  t) or   # EUR/COL: 1.334.847,00
-                re.match(r"^-?\d{6,}$",                          t) or   # entero sin formato ≥6 dígitos
-                re.match(r"^-?\d{1,9},\d{2}$",                  t)       # COL sin miles: 500,00 / 12345,67
-            )
-
-        def _to_float(text: str):
-            t = _clean(text)
-            # Formato europeo: puntos como miles, coma como decimal → 1.334.847,00
-            if re.match(r"^-?\d{1,3}(\.\d{3})+(,\d{1,2})?$", t):
-                t = t.replace(".", "").replace(",", ".")
-            else:
-                t = t.replace(",", "")
-            try:    return float(t)
+        def _to_date(v):
+            if v is None: return None
+            try:
+                if pd.isna(v): return None
+            except TypeError:
+                pass
+            if isinstance(v, pd.Timestamp): return v.date()
+            if isinstance(v, datetime):     return v.date()
+            if isinstance(v, date):         return v
+            try: return pd.to_datetime(str(v)).date()
             except: return None
 
-        def _parse_extracto_page(lines, w):
-            rows = []
-            for line in lines:
-                if not line: continue
+        # ── Excel parsers ─────────────────────────────────────────────────────
 
-                # ── Detectar fecha (primeros tokens, zona flexible hasta 40%) ───
-                day, mon = None, None
-                for tok_x, tok_t in line:
-                    if tok_x >= w * 0.40:
-                        break
-                    tc = _clean(tok_t)
-                    # DD/MM/YYYY o DD-MM-YYYY (fecha completa)
-                    m = re.match(r"^(\d{1,2})[/\-](\d{2})[/\-]\d{2,4}$", tc)
-                    if m:
-                        d, mo = int(m.group(1)), int(m.group(2))
-                        if 1 <= d <= 31 and 1 <= mo <= 12:
-                            day, mon = d, mo; break
-                    # YYYY/MM/DD o YYYY-MM-DD
-                    m2 = re.match(r"^\d{4}[/\-](\d{2})[/\-](\d{1,2})$", tc)
-                    if m2:
-                        mo, d = int(m2.group(1)), int(m2.group(2))
-                        if 1 <= d <= 31 and 1 <= mo <= 12:
-                            day, mon = d, mo; break
-                    # DD/MM (sin año)
-                    m3 = re.match(r"^(\d{1,2})[/\-](\d{2})$", tc)
-                    if m3:
-                        d, mo = int(m3.group(1)), int(m3.group(2))
-                        if 1 <= d <= 31 and 1 <= mo <= 12:
-                            day, mon = d, mo; break
-                    # Solo día: DD
-                    if re.match(r"^\d{1,2}$", tc):
-                        d = int(tc)
-                        if 1 <= d <= 31:
-                            day = d; break
+        def _find_header_row(df_raw, keywords, max_rows=20):
+            """Row index where the most keywords match (min 2 required)."""
+            best_row, best_score = None, 0
+            for r in range(min(max_rows, len(df_raw))):
+                row_str = " ".join(str(v).upper() for v in df_raw.iloc[r] if pd.notna(v))
+                score = sum(1 for kw in keywords if kw in row_str)
+                if score > best_score:
+                    best_score, best_row = score, r
+            return best_row if best_score >= 2 else None
 
-                if day is None: continue
-
-                # ── Recopilar todos los montos en la mitad derecha ─────────────
-                # Estrategia: tomar todos los números monetarios (x > 45% del ancho),
-                # ordenarlos de izquierda a derecha.
-                # El más a la derecha = saldo; el anterior = monto de transacción.
-                all_amounts = []   # (x, valor)
-                i = 0
-                while i < len(line):
-                    x, t = line[i]
-                    tc = _clean(t)
-                    if x < w * 0.45:
-                        i += 1; continue
-                    # Monto negativo partido: "-" seguido de número
-                    if tc == "-" and i + 1 < len(line):
-                        nx, nt = line[i+1]
-                        if _is_amount(nt) and nx >= w * 0.45 and (nx - x) < w * 0.08:
-                            v = _to_float(nt)
-                            if v: all_amounts.append((nx, -abs(v)))
-                            i += 2; continue
-                    if _is_amount(tc):
-                        v = _to_float(tc)
-                        if v is not None and abs(v) >= 50:
-                            all_amounts.append((x, v))
-                    i += 1
-
-                if len(all_amounts) < 2: continue
-
-                all_amounts.sort(key=lambda a: a[0])
-                saldo = abs(all_amounts[-1][1])
-                valor = all_amounts[-2][1]
-
-                # ── Clasificar débito / crédito ────────────────────────────────
-                desc_tokens = [t for x, t in line if not _is_amount(t) and x < all_amounts[-2][0]]
-                desc_lower  = " ".join(desc_tokens).lower()
-                cargo_kw = {"cargo", "giro", "gravamen", " db ", "pago",
-                            "impuesto", "cheque", "comision", "débito", "debito"}
-                if valor < 0:
-                    debito, credito = abs(valor), 0.0
-                elif any(k in desc_lower for k in cargo_kw):
-                    debito, credito = valor, 0.0
-                else:
-                    debito, credito = 0.0, valor
-
-                # ── Descripción: tokens no-numéricos entre fecha y primer monto ─
-                first_amount_x = all_amounts[0][0]
-                desc_parts = [
-                    _clean(t) for x, t in line
-                    if w * 0.08 < x < first_amount_x - w * 0.01
-                    and not _is_amount(t)
-                    and len(_clean(t)) > 1
-                ]
-                desc = " ".join(desc_parts[:12])
-
-                rows.append({
-                    "dia": day, "mes": mon, "descripcion": desc,
-                    "debito": debito, "credito": credito, "saldo": saldo,
-                })
-            return rows
-
-        def _saldo_final_extracto(images) -> float | None:
-            """Busca 'Saldo Final' en el texto del extracto, desde la última página."""
-            for img in reversed(images):
-                text = pytesseract.image_to_string(img, lang="spa", config="--psm 6")
-                for line in text.split("\n"):
-                    if re.search(r"saldo\s+(final|al\s+corte|bancario)", line, re.IGNORECASE):
-                        nums = re.findall(r"[\d,]+\.\d{2}", line)
-                        for n in nums:
-                            v = _to_float(n)
-                            if v and v > 0:
-                                return v
-            return None
-
-        def _find_saldo_fitz(pdf_path: str) -> float | None:
-            """OCR todas las páginas del PDF para encontrar el Saldo Final."""
-            try:
-                doc = fitz.open(pdf_path)
-                n_pages = len(doc)
-                for pg_idx in range(n_pages):
-                    page = doc[pg_idx]
-                    img  = _fitz_render_page(page, dpi=200)
-                    text = pytesseract.image_to_string(img, config="--psm 6")
-                    for line in text.split("\n"):
-                        if re.search(
-                            r"saldo\s*(final|al\s*corte|bancario|disponible)",
-                            line, re.IGNORECASE
-                        ):
-                            # Extraer todos los números de la línea (con o sin decimal)
-                            nums = re.findall(r"[\d]{1,3}(?:[,.\s]\d{3})+(?:[,.]\d{2})?|\d{6,}", line)
-                            for n_str in reversed(nums):
-                                # Normalizar: quitar separadores de miles, manejar decimal
-                                cleaned = re.sub(r"[,.\s](?=\d{3}(?:[,.\s]|$))", "", n_str)
-                                # Intentar con coma como decimal también
-                                cleaned = re.sub(r",(\d{2})$", r".\1", cleaned)
-                                try:
-                                    v = float(cleaned.replace(",", "").replace(" ", ""))
-                                    if v > 100_000:
-                                        doc.close()
-                                        return v
-                                except Exception:
-                                    pass
-                doc.close()
-            except Exception:
-                pass
-            return None
-
-        def _fitz_render_page(fitz_page, dpi=150):
-            """Renderiza una página fitz como imagen PIL (sin poppler)."""
-            zoom = dpi / 72
-            mat  = fitz.Matrix(zoom, zoom)
-            pix  = fitz_page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-            return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-        def _ocr_page(fitz_page, dpi=150):
-            """OCR sobre una página: renderiza con fitz, lee con tesseract."""
-            img   = _fitz_render_page(fitz_page, dpi=dpi)
-            data  = pytesseract.image_to_data(
-                img, config="--psm 6",
-                output_type=pytesseract.Output.DATAFRAME
-            )
-            data  = data[data.conf > 0].dropna(subset=["text"]).copy()
-            data["text"] = data["text"].astype(str).str.strip()
-            data  = data[data["text"] != ""].sort_values(["top", "left"])
-            lines, cur, cur_y = [], [], None
-            for _, row in data.iterrows():
-                if cur_y is None or abs(row["top"] - cur_y) <= 12:
-                    cur.append((row["left"], row["text"]))
-                    cur_y = cur_y or row["top"]
-                else:
-                    if cur: lines.append(sorted(cur))
-                    cur, cur_y = [(row["left"], row["text"])], row["top"]
-            if cur: lines.append(sorted(cur))
-            return lines, img.width
-
-        def _build_fitz_lines(words, tol=4):
-            lines, cur, cur_y = [], [], None
-            for x0,y0,x1,y1,word,*_ in sorted(words, key=lambda r:(round(r[1],1),r[0])):
-                if cur_y is None or abs(y0-cur_y) <= tol:
-                    cur.append((x0,word)); cur_y = cur_y or y0
-                else:
-                    if cur: lines.append(sorted(cur))
-                    cur, cur_y = [(x0,word)], y0
-            if cur: lines.append(sorted(cur))
-            return lines
-
-        def parse_extracto(ano, mes):
-            all_rows, filas = [], []
-            debug = []
-            try:
-                doc = fitz.open(pdf_ext_path)
-                n   = len(doc)
-                for pg, page in enumerate(doc, 1):
-                    words = page.get_text("words")
-                    w     = page.rect.width
-                    modo  = "?"
-
-                    # Intentar texto directo solo si hay suficientes palabras (no es pura imagen)
-                    if len(words) > 80:
-                        lines = _build_fitz_lines(words)
-                        rows  = _parse_extracto_page(lines, w)
-                        modo  = "fitz"
-                        # Si fitz no produjo filas, el texto embebido es basura → usar OCR
-                        if not rows:
-                            lines, w = _ocr_page(page, dpi=300)
-                            rows  = _parse_extracto_page(lines, w)
-                            modo  = "fitz→ocr"
-                    else:
-                        # Pocos o nulos palabras → PDF escaneado puro → OCR directo
-                        lines, w = _ocr_page(page, dpi=300)
-                        rows  = _parse_extracto_page(lines, w)
-                        modo  = "ocr"
-
-                    if pg == 1:
-                        raw = page.get_text("text") or ""
-                        debug = [
-                            f"Págs:{n} | Palabras p1:{len(words)} | Motor:{modo}",
-                            f"Raw p1: {raw[:300]!r}",
-                        ] + [" | ".join(t for _,t in ln) for ln in lines[:8]]
-                    filas.append((pg, len(rows), modo))
-                    all_rows.extend(rows)
-                doc.close()
-            except Exception as e:
-                debug = [f"ERROR: {e}"]
-
-            st.session_state["plumber_sample"] = debug
-            st.session_state["ext_debug"]      = filas
-
-            if not all_rows:
-                return pd.DataFrame(), None
-            df = pd.DataFrame(all_rows)
-            def _make_date(row):
-                m = int(row["mes"]) if pd.notna(row.get("mes")) and row.get("mes") else mes
-                max_day = 28 if m==2 else 30 if m in [4,6,9,11] else 31
-                return date(ano, m, min(int(row["dia"]), max_day))
-            df["fecha"] = df.apply(_make_date, axis=1)
-            return df.sort_values("fecha").reset_index(drop=True), None
-
-        # ── Informe Movimiento General (última página) ────────────────────────
-        # Sin posiciones fijas: usa delta de saldo para determinar débito/crédito
-        def parse_informe(img):
-            lines = _ocr_lines(img)
-            rows = []
-            prev_saldo = None
-            for line in lines:
-                # Línea de asiento: contiene patrón L-1-919-1 etc.
-                comprobante = next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None)
-                if not comprobante: continue
-                fecha_str = next((t for _, t in line if re.match(r"^\d{4}/\d{2}/\d{2}$", t)), None)
-                if not fecha_str: continue
-                try:    fecha = datetime.strptime(fecha_str, "%Y/%m/%d").date()
-                except: continue
-
-                # Montos solo en zona derecha (x > 50%): evita capturar números de descripción
-                amounts = sorted(
-                    [(x, _parse_num(t)) for x, t in line
-                     if _is_currency(t) and _parse_num(t) and _parse_num(t) > 0
-                     and x > img.width * 0.50],
-                    key=lambda a: a[0]
-                )
-                if not amounts: continue
-
-                # El saldo es siempre el monto más a la derecha
-                saldo = amounts[-1][1]
-
-                # El monto de transacción es el anterior al saldo
-                non_saldo = [v for _, v in amounts[:-1]]
-                if not non_saldo: continue
-                amount = non_saldo[-1]
-
-                # Débito = saldo sube (entra dinero), Crédito = saldo baja (sale dinero)
-                if prev_saldo is not None:
-                    if saldo >= prev_saldo:
-                        debito, credito = amount, 0.0
-                    else:
-                        debito, credito = 0.0, amount
-                else:
-                    # Primera fila: usar posición relativa (déb está antes de 68% del ancho)
-                    x_amount = amounts[-2][0] if len(amounts) >= 2 else 0
-                    if x_amount < img.width * 0.68:
-                        debito, credito = amount, 0.0
-                    else:
-                        debito, credito = 0.0, amount
-                prev_saldo = saldo
-
-                # Descripción: tokens entre la fecha y la zona de montos
-                fecha_x  = next((x for x, t in line if t == fecha_str), 0)
-                monto_x  = amounts[-2][0] if len(amounts) >= 2 else img.width
-                desc = " ".join(
-                    t for x, t in sorted(line)
-                    if x > fecha_x and x < monto_x
-                    and not re.match(r"^[\d,\.]+$", t)
-                    and t not in ("O", "0", "SUC", "NIT")
-                ).strip()
-
-                rows.append({
-                    "comprobante": comprobante, "fecha": fecha, "descripcion": desc,
-                    "debito": debito, "credito": credito, "saldo": saldo,
-                })
-            return pd.DataFrame(rows) if rows else pd.DataFrame(
-                columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
-
-        def _parse_informe_plumber(page):
-            """Auxiliar con pdfplumber: misma lógica de parse_informe pero sin OCR."""
-            lines, _ = _plumber_lines(page)
-            rows = []
-            prev_saldo = None
-            for line in lines:
-                comprobante = next((t for _, t in line if re.match(r"^[A-Z]-\d+-\d+", t)), None)
-                if not comprobante: continue
-                fecha_str = next((t for _, t in line if re.match(r"^\d{4}/\d{2}/\d{2}$", t)), None)
-                if not fecha_str: continue
-                try:    fecha = datetime.strptime(fecha_str, "%Y/%m/%d").date()
-                except: continue
-                amounts = sorted(
-                    [(x, _parse_num(t)) for x, t in line
-                     if _is_currency(t) and _parse_num(t) and _parse_num(t) > 0
-                     and x > page.width * 0.50],
-                    key=lambda a: a[0]
-                )
-                if not amounts: continue
-                saldo = amounts[-1][1]
-                non_saldo = [v for _, v in amounts[:-1]]
-                if not non_saldo: continue
-                amount = non_saldo[-1]
-                if prev_saldo is not None:
-                    if saldo >= prev_saldo: debito, credito = amount, 0.0
-                    else:                   debito, credito = 0.0, amount
-                else:
-                    x_amt = amounts[-2][0] if len(amounts) >= 2 else 0
-                    if x_amt < page.width * 0.68: debito, credito = amount, 0.0
-                    else:                         debito, credito = 0.0, amount
-                prev_saldo = saldo
-                fecha_x = next((x for x, t in line if t == fecha_str), 0)
-                monto_x  = amounts[-2][0] if len(amounts) >= 2 else page.width
-                desc = " ".join(
-                    t for x, t in sorted(line)
-                    if x > fecha_x and x < monto_x
-                    and not re.match(r"^[\d,\.]+$", t)
-                    and t not in ("O", "0", "SUC", "NIT")
-                ).strip()
-                rows.append({"comprobante": comprobante, "fecha": fecha, "descripcion": desc,
-                             "debito": debito, "credito": credito, "saldo": saldo})
-            return pd.DataFrame(rows) if rows else pd.DataFrame(
-                columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
-
-        def _parse_informe_fitz(lines, w, col_split=None, has_movimiento=False):
-            """
-            Layout: DÉBITO | CRÉDITO | SALDO [| MOVIMIENTO]
-            Ordena por borde derecho estimado (xr) para que columnas right-aligned
-            queden en el orden correcto aunque números grandes tengan x0 muy a la izq.
-            cw: ancho de carácter en px (OCR 300dpi) o pt (fitz).
-            """
-            cw = 27 if w > 1000 else 6.5   # OCR pixels vs fitz points
-
-            def _xr(x0, text):
-                return x0 + len(text) * cw
-
-            rows = []
-            for line in lines:
-                comprobante = next((t for _, t in line if _COMP_RE.match(t)), None)
-                if not comprobante: continue
-                fecha_str = next((t for _, t in line if re.match(r"^\d{4}/\d{2}/\d{2}$", t)), None)
-                if not fecha_str: continue
-                try:    fecha = datetime.strptime(fecha_str, "%Y/%m/%d").date()
-                except: continue
-
-                # (x0_original, xr_estimado, valor) ordenado por xr → orden de columnas correcto
-                raw_amounts = sorted(
-                    [(x, _xr(x, t), _to_float(t)) for x, t in line
-                     if _is_amount(t) and _to_float(t) and abs(_to_float(t)) > 0
-                     and x > w * 0.45],
-                    key=lambda a: a[1]
-                )
-                if not raw_amounts: continue
-
-                x0_primer = raw_amounts[0][0]   # para delimitar la descripción
-
-                # has_movimiento → rightmost (por xr) = MOVIMIENTO, descartarlo
-                if has_movimiento:
-                    if len(raw_amounts) < 2: continue
-                    saldo = abs(raw_amounts[-2][2])
-                    txn   = raw_amounts[:-2]
-                else:
-                    saldo = abs(raw_amounts[-1][2])
-                    txn   = raw_amounts[:-1]
-
-                if not txn: continue
-
-                if len(txn) == 1:
-                    x0_a, xr_a, val_a = txn[0]
-                    val = abs(val_a)
-                    if col_split is not None:
-                        debito, credito = (val, 0.0) if xr_a < col_split else (0.0, val)
-                    else:
-                        xr_s = raw_amounts[-2][1] if has_movimiento else raw_amounts[-1][1]
-                        mid  = (w * 0.45 + xr_s) / 2
-                        debito, credito = (val, 0.0) if xr_a < mid else (0.0, val)
-                else:
-                    debito = credito = 0.0
-                    for x0_a, xr_a, val_a in txn:
-                        if col_split is not None:
-                            if xr_a < col_split: debito  = max(debito,  abs(val_a))
-                            else:                credito = max(credito, abs(val_a))
-                        else:
-                            debito  = abs(txn[0][2])
-                            credito = abs(txn[-1][2])
-                            break
-
-                if debito == 0 and credito == 0: continue
-
-                fecha_x = next((x for x, t in line if t == fecha_str), 0)
-                desc = " ".join(t for x, t in sorted(line)
-                    if x > fecha_x and x < x0_primer - w * 0.01
-                    and not re.match(r"^[\d,\.]+$", t)
-                    and t not in ("O", "0", "SUC", "NIT")).strip()
-
-                rows.append({"comprobante": comprobante, "fecha": fecha, "descripcion": desc,
-                             "debito": debito, "credito": credito, "saldo": saldo})
-            return pd.DataFrame(rows) if rows else pd.DataFrame(
-                columns=["comprobante","fecha","descripcion","debito","credito","saldo"])
-
-        _COMP_RE = re.compile(r"^[A-Z]{1,3}-\d")   # comprobante: 1-3 letras, guión, dígito
-
-        def parse_auxiliar():
-            """
-            Parsea auxiliar con PyMuPDF + fallback OCR (igual que extracto).
-            Si fitz extrae palabras pero ninguna línea tiene comprobante, reintenta con OCR.
-            """
-            all_pages = []   # (lines, w, modo) por página
-            aux_sample = []
-            x0_deb = x0_cred = None
-
-            try:
-                doc = fitz.open(pdf_aux_path)
-
-                for pg, page in enumerate(doc, 1):
-                    words = page.get_text("words")
-                    w     = page.rect.width
-                    modo  = "?"
-
-                    if len(words) > 80:
-                        lines_fitz = _build_fitz_lines(words, tol=5)
-                        # Verificar si fitz produjo algo útil (alguna línea con comprobante)
-                        has_comp = any(
-                            any(_COMP_RE.match(t) for _, t in ln)
-                            for ln in lines_fitz
-                        )
-                        if has_comp:
-                            lines = lines_fitz
-                            modo  = "fitz"
-                            # Detectar encabezados DÉBITO/CRÉDITO
-                            for _x0,_y0,_x1,_y1,wrd,*_ in words:
-                                wu = wrd.upper()
-                                if x0_deb is None and re.search(r'D[EÉ]BITO', wu) and _x0 > w*0.30:
-                                    x0_deb = _x0
-                                if x0_cred is None and re.search(r'CR[EÉ]DITO', wu) and _x0 > w*0.30:
-                                    x0_cred = _x0
-                        else:
-                            lines, w = _ocr_page(page, dpi=300)
-                            modo = "fitz→ocr"
-                    else:
-                        lines, w = _ocr_page(page, dpi=300)
-                        modo = "ocr"
-
-                    # Detectar encabezados de columna en las líneas ya procesadas
-                    # (funciona tanto para fitz como para OCR)
-                    if x0_deb is None or x0_cred is None:
-                        for lne in lines:
-                            for lx, lt in lne:
-                                ltu = lt.upper()
-                                if x0_deb is None and re.search(r'D[EÉ]BITO', ltu) and lx > w * 0.30:
-                                    x0_deb = lx
-                                if x0_cred is None and re.search(r'CR[EÉ]DITO', ltu) and lx > w * 0.30:
-                                    x0_cred = lx
-
-                    if pg == 1:
-                        aux_sample = [" | ".join(t for _, t in ln) for ln in lines[:8]]
-                    all_pages.append((lines, w, modo))
-
-                doc.close()
-            except Exception as e:
-                aux_sample = [f"ERROR: {e}"]
-
-            st.session_state["aux_sample"] = aux_sample
-            if not all_pages:
-                return pd.DataFrame(
-                    columns=["comprobante","fecha","descripcion","debito","credito","saldo"]), None
-
-            # Detectar si hay columna MOVIMIENTO buscando en todas las líneas
-            has_movimiento = False
-            if not has_movimiento:
-                for lines_pg, w_pg, _ in all_pages:
-                    for lne in lines_pg:
-                        for lx, lt in lne:
-                            if lt.upper() == "MOVIMIENTO" and lx > w_pg * 0.40:
-                                has_movimiento = True; break
-                        if has_movimiento: break
-                    if has_movimiento: break
-
-            # col_split: midpoint entre xr de los encabezados, usando el mismo cw de _parse_informe_fitz
-            col_split = None
-            if x0_deb is not None and x0_cred is not None:
-                first_w = all_pages[0][1] if all_pages else 595
-                cw = 27 if first_w > 1000 else 6.5
-                xr_deb  = x0_deb  + len("DÉBITOS")  * cw
-                xr_cred = x0_cred + len("CRÉDITOS") * cw
-                col_split = (xr_deb + xr_cred) / 2
-            st.session_state["col_split_debug"] = (
-                f"x0_deb={x0_deb} x0_cred={x0_cred} col_split={col_split} "
-                f"has_movimiento={has_movimiento}"
+        def _norm(s):
+            """Uppercase + strip accents for header comparison."""
+            s = str(s).upper()
+            return "".join(
+                c for c in unicodedata.normalize("NFD", s)
+                if unicodedata.category(c) != "Mn"
             )
 
-            all_rows = []
-            rows_per_page = []
-            for pg_i, (lines, w, modo) in enumerate(all_pages, 1):
-                df_p = _parse_informe_fitz(lines, w, col_split=col_split,
-                                           has_movimiento=has_movimiento)
-                rows_per_page.append((pg_i, len(df_p), modo))
-                if not df_p.empty:
-                    all_rows.append(df_p)
+        def _col_idx(header_vals, keywords):
+            """Column index: exact normalized match first, then partial match."""
+            nkws = [_norm(kw) for kw in keywords]
+            for nkw in nkws:            # exact pass
+                for i, v in enumerate(header_vals):
+                    if pd.notna(v) and _norm(v) == nkw:
+                        return i
+            for nkw in nkws:            # partial pass
+                for i, v in enumerate(header_vals):
+                    if pd.notna(v) and nkw in _norm(v):
+                        return i
+            return None
 
-            st.session_state["aux_rows_per_page"] = rows_per_page
+        def _col_idx_last(header_vals, keywords):
+            """Last column index whose normalized header contains any keyword."""
+            result = None
+            for kw in keywords:
+                nkw = _norm(kw)
+                for i, v in enumerate(header_vals):
+                    if pd.notna(v) and nkw in _norm(v):
+                        result = i
+            return result
 
-            if not all_rows:
-                return pd.DataFrame(
-                    columns=["comprobante","fecha","descripcion","debito","credito","saldo"]), None
-            return pd.concat(all_rows, ignore_index=True), None
+        def parse_extracto_excel(file_bytes, filename):
+            engine = "xlrd" if filename.lower().endswith(".xls") else "openpyxl"
+            df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None,
+                                   engine=engine, dtype=object)
+
+            # ── Saldo final ────────────────────────────────────────────────
+            saldo_ext = None
+            for r in range(min(10, len(df_raw))):
+                row_vals = df_raw.iloc[r].tolist()
+                row_str  = " ".join(str(v).upper() for v in row_vals if pd.notna(v))
+                if "SALDO FINAL" in row_str or "SALDO AL CORTE" in row_str:
+                    col_sf = next((c for c, v in enumerate(row_vals)
+                                   if pd.notna(v) and "SALDO FINAL" in str(v).upper()), None)
+                    if col_sf is not None and r + 1 < len(df_raw):
+                        try:
+                            fv = float(df_raw.iloc[r + 1, col_sf])
+                            if fv > 100_000:
+                                saldo_ext = fv
+                        except Exception:
+                            pass
+                    break
+
+            # ── Header row ──────────────────────────────────────────────────
+            hdr_row = _find_header_row(
+                df_raw,
+                ["FECHA", "DESCRIPCI", "DEP", "RETIRO"],
+                max_rows=15,
+            )
+            if hdr_row is None:
+                st.warning("Extracto: no se encontró fila de encabezado.")
+                return (pd.DataFrame(columns=["fecha","dia","descripcion",
+                                               "debito","credito","saldo"]),
+                        saldo_ext)
+
+            hdr     = df_raw.iloc[hdr_row].tolist()
+            col_f   = _col_idx(hdr, ["FECHA"])
+            col_d   = _col_idx(hdr, ["DESCRIPCION"])
+            col_cre = _col_idx(hdr, ["DEP", "ABONO", "CRÉDITO", "CREDITO"])
+            col_deb = _col_idx(hdr, ["RETIRO", "CARGO", "DÉBITO", "DEBITO", "PAGO"])
+            col_sal = _col_idx(hdr, ["SALDO"])
+
+            st.session_state["ext_cols"] = (
+                f"header_row={hdr_row} | fecha={col_f} | desc={col_d} | "
+                f"dep(cre)={col_cre} | retiro(deb)={col_deb} | saldo={col_sal}"
+            )
+
+            rows = []
+            for r in range(hdr_row + 1, len(df_raw)):
+                row   = df_raw.iloc[r]
+                fecha = _to_date(row.iloc[col_f] if col_f is not None else None)
+                if fecha is None:
+                    continue
+
+                debito  = abs(_to_num(row.iloc[col_deb] if col_deb is not None else None))
+                credito = abs(_to_num(row.iloc[col_cre] if col_cre is not None else None))
+                if debito == 0 and credito == 0:
+                    continue
+
+                saldo = abs(_to_num(row.iloc[col_sal] if col_sal is not None else None))
+                desc  = (str(row.iloc[col_d]).strip()
+                         if col_d is not None and pd.notna(row.iloc[col_d]) else "")
+
+                rows.append({
+                    "fecha": fecha, "dia": fecha.day,
+                    "descripcion": desc,
+                    "debito": debito, "credito": credito, "saldo": saldo,
+                })
+
+            if not rows:
+                return (pd.DataFrame(columns=["fecha","dia","descripcion",
+                                               "debito","credito","saldo"]),
+                        saldo_ext)
+
+            df = pd.DataFrame(rows).sort_values("fecha").reset_index(drop=True)
+            return df, saldo_ext
+
+        def parse_auxiliar_excel(file_bytes, filename):
+            engine = "xlrd" if filename.lower().endswith(".xls") else "openpyxl"
+            df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None,
+                                   engine=engine, dtype=object)
+
+            # ── Header row ──────────────────────────────────────────────────
+            hdr_row = _find_header_row(
+                df_raw,
+                ["COMPROBANTE", "FECHA", "DEBITO", "CREDITO"],
+                max_rows=20,
+            )
+            if hdr_row is None:
+                st.warning("Auxiliar: no se encontró fila de encabezado.")
+                return (pd.DataFrame(columns=["comprobante","fecha","descripcion",
+                                               "debito","credito","saldo"]),
+                        None)
+
+            hdr      = df_raw.iloc[hdr_row].tolist()
+            col_comp = _col_idx(hdr, ["COMPROBANTE"])
+            col_f    = _col_idx(hdr, ["FECHA"])
+            col_nom  = _col_idx(hdr, ["NOMBRE"])
+            col_desc = _col_idx(hdr, ["DESCRIPCION"])
+            col_deb  = _col_idx(hdr, ["DEBITO", "DÉBITO"])
+            col_cre  = _col_idx(hdr, ["CREDITO", "CRÉDITO"])
+            # SALDO MOV. is the rightmost saldo; "SALDO CUENTA" is leftmost — take last match
+            col_sal  = _col_idx(hdr, ["SALDO MOV"])
+            if col_sal is None:
+                col_sal = _col_idx_last(hdr, ["SALDO"])
+
+            st.session_state["aux_cols"] = (
+                f"header_row={hdr_row} | comp={col_comp} | fecha={col_f} | "
+                f"nombre={col_nom} | desc={col_desc} | "
+                f"deb={col_deb} | cre={col_cre} | saldo={col_sal}"
+            )
+
+            _SKIP = {"TOTAL", "SUBTOTAL", "SALDO", "CUENTA", "NAN", "NONE"}
+
+            rows = []
+            for r in range(hdr_row + 1, len(df_raw)):
+                row  = df_raw.iloc[r]
+                comp = (str(row.iloc[col_comp]).strip()
+                        if col_comp is not None and pd.notna(row.iloc[col_comp])
+                        else "")
+                if not comp or any(kw in comp.upper() for kw in _SKIP):
+                    continue
+
+                fecha = _to_date(row.iloc[col_f] if col_f is not None else None)
+                if fecha is None:
+                    continue
+
+                debito  = abs(_to_num(row.iloc[col_deb] if col_deb is not None else None))
+                credito = abs(_to_num(row.iloc[col_cre] if col_cre is not None else None))
+                if debito == 0 and credito == 0:
+                    continue
+
+                saldo = _to_num(row.iloc[col_sal] if col_sal is not None else None)
+
+                parts = []
+                if col_nom is not None and pd.notna(row.iloc[col_nom]) and str(row.iloc[col_nom]).strip():
+                    parts.append(str(row.iloc[col_nom]).strip())
+                if col_desc is not None and pd.notna(row.iloc[col_desc]) and str(row.iloc[col_desc]).strip():
+                    parts.append(str(row.iloc[col_desc]).strip())
+                desc = " - ".join(parts) if parts else comp
+
+                rows.append({
+                    "comprobante": comp, "fecha": fecha,
+                    "descripcion": desc,
+                    "debito": debito, "credito": credito, "saldo": saldo,
+                })
+
+            if not rows:
+                return (pd.DataFrame(columns=["comprobante","fecha","descripcion",
+                                               "debito","credito","saldo"]),
+                        None)
+
+            df = pd.DataFrame(rows).sort_values("fecha").reset_index(drop=True)
+            return df, None
 
         # ── Matching ──────────────────────────────────────────────────────────
         def reconciliar(df_ext, df_inf, diferencia_saldos):
-            # Índice de extracto: (fecha, monto_redondeado_100, tipo) → lista de índices
-            # Redondear a $100 para absorber diferencias de centavos del OCR
             ext_idx = {}
             for i, row in df_ext.iterrows():
-                for monto, tipo in [(row.debito,"D"),(row.credito,"C")]:
+                for monto, tipo in [(row.debito, "D"), (row.credito, "C")]:
                     if monto > 0:
                         key = (row.fecha, round(monto / 100) * 100, tipo)
                         ext_idx.setdefault(key, []).append(i)
 
             matched_ext, matched_inf = set(), set()
             for i, row in df_inf.iterrows():
-                for monto, tipo_ext in [(row.debito,"C"),(row.credito,"D")]:
+                for monto, tipo_ext in [(row.debito, "C"), (row.credito, "D")]:
                     if monto <= 0: continue
-                    found = False
-                    # ±10 días de tolerancia fecha, ±1% de tolerancia monto
-                    tol_amt = max(round(monto * 0.01 / 100) * 100, 1000)
+                    found    = False
+                    tol_amt  = max(round(monto * 0.01 / 100) * 100, 1000)
                     for day_d in [0,-1,-2,-3,-4,-5,-6,-7,-8,-9,-10,1,2,3,4,5]:
                         fecha_try = row.fecha + timedelta(days=day_d)
                         for amt_step in range(0, int(tol_amt) + 100, 100):
@@ -708,8 +284,8 @@ if st.button("Generar conciliación", type="primary"):
                             if found: break
                         if found: break
 
-            _e = lambda lst, cols: pd.DataFrame(lst) if lst else pd.DataFrame(columns=cols)
-            emp = lambda cols: pd.DataFrame(columns=cols)
+            _e   = lambda lst, cols: pd.DataFrame(lst) if lst else pd.DataFrame(columns=cols)
+            emp  = lambda cols: pd.DataFrame(columns=cols)
 
             if round(abs(diferencia_saldos)) == 0:
                 return (emp(["fecha","beneficiario","comprobante","monto"]),
@@ -718,7 +294,6 @@ if st.button("Generar conciliación", type="primary"):
                         emp(["fecha","descripcion","comprobante","monto"]),
                         True)
 
-            # Devolver TODAS las partidas sin cruzar (no solo la más cercana al target)
             notas_cargo, notas_abono = [], []
             for i, row in df_ext.iterrows():
                 if i in matched_ext: continue
@@ -739,7 +314,6 @@ if st.button("Generar conciliación", type="primary"):
                     ingresos_pend.append({"fecha": row.fecha, "descripcion": row.descripcion,
                                           "comprobante": row.comprobante, "monto": row.debito})
 
-            # Ordenar por monto desc para que lo más relevante aparezca primero
             notas_cargo.sort(  key=lambda x: x["monto"], reverse=True)
             notas_abono.sort(  key=lambda x: x["monto"], reverse=True)
             cheques_pend.sort( key=lambda x: x["monto"], reverse=True)
@@ -754,12 +328,6 @@ if st.button("Generar conciliación", type="primary"):
             )
 
         def _buscar_partida(df_ext, df_inf, diferencia_saldos):
-            """
-            Detecta la partida sobrante usando un pool/contador:
-            cada transacción del extracto puede absorber exactamente UNA entrada
-            del auxiliar. Si el auxiliar tiene dos veces el mismo monto pero el
-            banco solo una, la segunda queda sin par → es la partida extra.
-            """
             from collections import defaultdict
 
             if df_ext.empty or df_inf.empty:
@@ -768,7 +336,6 @@ if st.button("Generar conciliación", type="primary"):
             target  = abs(diferencia_saldos)
             tol_dif = max(target * 0.15, 5_000)
 
-            # Redondear a miles para absorber ruido OCR (±$500 queda en el mismo bucket)
             def _key(v):
                 return round(v / 1_000) * 1_000
 
@@ -780,7 +347,6 @@ if st.button("Generar conciliación", type="primary"):
                 return pool
 
             def _consume(pool, monto, tol_match=5_000):
-                """Consume el bucket más cercano dentro de tolerancia. Devuelve True si encontró."""
                 m_key = _key(monto)
                 best_key, best_dist = None, float("inf")
                 for k, cnt in pool.items():
@@ -794,19 +360,16 @@ if st.button("Generar conciliación", type="primary"):
                 return False
 
             if diferencia_saldos < 0:
-                # Banco < Contabilidad: el auxiliar tiene un CRÉDITO (abono) extra
-                # que el banco no registró. Ese abono infla el saldo contable.
-                # Comparamos CRÉDITOs del auxiliar contra CRÉDITOs del extracto.
                 ext_c_pool = defaultdict(int)
                 for _, r in df_ext.iterrows():
                     if r.credito > 0: ext_c_pool[_key(r.credito)] += 1
 
                 candidatos = []
                 for _, row in df_inf.iterrows():
-                    monto = row.credito          # solo CRÉDITO en auxiliar
+                    monto = row.credito
                     if monto < 1_000: continue
                     if _consume(ext_c_pool, monto):
-                        pass  # tiene par en el banco → ok
+                        pass
                     else:
                         dist = abs(monto - target)
                         if dist <= tol_dif:
@@ -821,15 +384,13 @@ if st.button("Generar conciliación", type="primary"):
                                 "dist_target": dist,
                             })
             else:
-                # Banco > Contabilidad: el extracto tiene un CRÉDITO extra que
-                # el auxiliar no registró, inflando el saldo bancario.
                 aux_c_pool = defaultdict(int)
                 for _, r in df_inf.iterrows():
                     if r.credito > 0: aux_c_pool[_key(r.credito)] += 1
 
                 candidatos = []
                 for _, row in df_ext.iterrows():
-                    monto = row.credito          # solo CRÉDITO en extracto
+                    monto = row.credito
                     if monto < 1_000: continue
                     if _consume(aux_c_pool, monto):
                         pass
@@ -865,7 +426,7 @@ if st.button("Generar conciliación", type="primary"):
             ws.merge_cells(f"A{r}:{get_column_letter(NCOLS)}{r}")
             c = ws[f"A{r}"]
             c.value = text
-            c.fill = fill
+            c.fill  = fill
             c.alignment = Alignment(horizontal="left", vertical="center")
             kw = {"bold": True, "size": 11, "color": "1F3864"}
             if font_kw: kw.update(font_kw)
@@ -873,46 +434,32 @@ if st.button("Generar conciliación", type="primary"):
             if height: ws.row_dimensions[r].height = height
 
         def _kv(ws, r, label, valor, fill_v=None):
-            """Fila de clave-valor: col A = etiqueta, col B = valor."""
             ca = ws.cell(row=r, column=1, value=label)
-            ca.font = Font(bold=True, size=10)
+            ca.font   = Font(bold=True, size=10)
             ca.border = _BRD
             cv = ws.cell(row=r, column=2, value=valor)
-            cv.border = _BRD
+            cv.border    = _BRD
             cv.alignment = Alignment(horizontal="right", vertical="center")
-            cv.font = Font(size=10)
+            cv.font      = Font(size=10)
             if fill_v: cv.fill = fill_v
 
         def _hrow(ws, r, cols):
             for c, v in enumerate(cols, 1):
                 cell = ws.cell(row=r, column=c, value=v)
-                cell.font = Font(bold=True, color="FFFFFF", size=9)
-                cell.fill = _HDR
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.font      = Font(bold=True, color="FFFFFF", size=9)
+                cell.fill      = _HDR
+                cell.alignment = Alignment(horizontal="center", vertical="center",
+                                           wrap_text=True)
                 cell.border = _BRD
 
         def _drow(ws, r, vals, fill=None):
             for c, v in enumerate(vals, 1):
                 cell = ws.cell(row=r, column=c, value=v)
                 if fill: cell.fill = fill
-                cell.border = _BRD
+                cell.border    = _BRD
                 cell.alignment = Alignment(vertical="center")
 
-        def _total_row(ws, r, label, total):
-            ws.merge_cells(f"A{r}:D{r}")
-            c = ws[f"A{r}"]
-            c.value = label
-            c.font = Font(bold=True, size=10)
-            c.fill = _LGRY
-            c.border = _BRD
-            c.alignment = Alignment(horizontal="right")
-            cv = ws.cell(row=r, column=5, value=total)
-            cv.font = Font(bold=True, size=10)
-            cv.fill = _LGRY
-            cv.border = _BRD
-            cv.alignment = Alignment(horizontal="right")
-
-        def build_excel(df_ext, df_inf, saldo_ext, saldo_cont, nombre_pdf, partida_faltante):
+        def build_excel(df_ext, df_inf, saldo_ext, saldo_cont, nombre_arch, partida_faltante):
             wb = Workbook()
             ws = wb.active; ws.title = "Conciliacion"
             for col, cw in zip("AB", [38, 26]):
@@ -920,20 +467,19 @@ if st.button("Generar conciliación", type="primary"):
 
             diferencia = round((saldo_ext or 0) - (saldo_cont or 0), 2)
 
-            # Título
             ws.merge_cells("A1:B1")
             c = ws["A1"]
-            c.value = "CONCILIACIÓN BANCARIA"
-            c.font = Font(bold=True, size=14, color="FFFFFF")
-            c.fill = PatternFill("solid", fgColor="1F3864")
+            c.value     = "CONCILIACIÓN BANCARIA"
+            c.font      = Font(bold=True, size=14, color="FFFFFF")
+            c.fill      = PatternFill("solid", fgColor="1F3864")
             c.alignment = Alignment(horizontal="center", vertical="center")
             ws.row_dimensions[1].height = 30
 
             ws.merge_cells("A2:B2")
-            c2 = ws["A2"]
-            c2.value = f"{nombre_pdf}   |   {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            c2.font = Font(size=9, color="666666")
-            c2.fill = PatternFill("solid", fgColor="F2F2F2")
+            c2       = ws["A2"]
+            c2.value = f"{nombre_arch}   |   {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            c2.font  = Font(size=9, color="666666")
+            c2.fill  = PatternFill("solid", fgColor="F2F2F2")
             c2.alignment = Alignment(horizontal="center")
 
             _kv(ws, 4, "SALDO EXTRACTO BANCARIO", _fmt_cop(saldo_ext),  _GRN)
@@ -943,43 +489,46 @@ if st.button("Generar conciliación", type="primary"):
 
             if partida_faltante:
                 ws.merge_cells("A8:B8")
-                lbl = ws["A8"]
+                lbl       = ws["A8"]
                 lbl.value = "PARTIDA FALTANTE IDENTIFICADA"
-                lbl.font = Font(bold=True, size=11, color="7F4F00")
-                lbl.fill = _YELL
+                lbl.font  = Font(bold=True, size=11, color="7F4F00")
+                lbl.fill  = _YELL
                 lbl.alignment = Alignment(horizontal="center", vertical="center")
                 ws.row_dimensions[8].height = 22
-
                 _kv(ws, 9,  "Fecha",       str(partida_faltante["fecha"]),       _YELL)
                 _kv(ws, 10, "Descripción", partida_faltante["descripcion"],      _YELL)
                 _kv(ws, 11, "Monto",       _fmt_cop(partida_faltante["monto"]),  _YELL)
                 _kv(ws, 12, "Tipo",        partida_faltante["tipo"],             _YELL)
                 _kv(ws, 13, "Origen",      partida_faltante["origen"],           _YELL)
 
-            # Hoja Extracto — última fila usa saldo_ext oficial
             ws2 = wb.create_sheet("Extracto")
-            for col, cw in zip("ABCDEF",[12,8,45,22,22,26]): ws2.column_dimensions[col].width = cw
+            for col, cw in zip("ABCDEF", [12, 8, 45, 22, 22, 26]):
+                ws2.column_dimensions[col].width = cw
             _hrow(ws2, 1, ["Fecha","Día","Descripción","Débito","Crédito","Saldo"])
             ext_rows = list(df_ext.iterrows())
             for i, (_, row) in enumerate(ext_rows, 2):
-                fill = _GRN if i%2==0 else _GREY
-                es_ultima = (i == len(ext_rows) + 1)
-                saldo_fila = saldo_ext if (es_ultima and saldo_ext) else row.saldo
-                _drow(ws2, i, [str(row.fecha), row.dia, row.descripcion,
-                    _fmt_cop(row.debito) if row.debito>0 else "",
-                    _fmt_cop(row.credito) if row.credito>0 else "",
-                    _fmt_cop(saldo_fila)], fill)
+                fill     = _GRN if i % 2 == 0 else _GREY
+                es_ult   = (i == len(ext_rows) + 1)
+                saldo_f  = saldo_ext if (es_ult and saldo_ext) else row.saldo
+                _drow(ws2, i,
+                      [str(row.fecha), row.dia, row.descripcion,
+                       _fmt_cop(row.debito)  if row.debito  > 0 else "",
+                       _fmt_cop(row.credito) if row.credito > 0 else "",
+                       _fmt_cop(saldo_f)],
+                      fill)
 
-            # Hoja Auxiliar
             ws3 = wb.create_sheet("Auxiliar")
-            for col, cw in zip("ABCDEF",[18,12,40,22,22,26]): ws3.column_dimensions[col].width = cw
+            for col, cw in zip("ABCDEF", [18, 12, 40, 22, 22, 26]):
+                ws3.column_dimensions[col].width = cw
             _hrow(ws3, 1, ["Comprobante","Fecha","Descripción","Débito","Crédito","Saldo"])
-            for i,(_, row) in enumerate(df_inf.iterrows(), 2):
-                fill = _GRN if i%2==0 else _GREY
-                _drow(ws3, i, [row.comprobante, str(row.fecha), row.descripcion,
-                    _fmt_cop(row.debito) if row.debito>0 else "",
-                    _fmt_cop(row.credito) if row.credito>0 else "",
-                    _fmt_cop(row.saldo)], fill)
+            for i, (_, row) in enumerate(df_inf.iterrows(), 2):
+                fill = _GRN if i % 2 == 0 else _GREY
+                _drow(ws3, i,
+                      [row.comprobante, str(row.fecha), row.descripcion,
+                       _fmt_cop(row.debito)  if row.debito  > 0 else "",
+                       _fmt_cop(row.credito) if row.credito > 0 else "",
+                       _fmt_cop(row.saldo)],
+                      fill)
 
             buf = io.BytesIO()
             wb.save(buf)
@@ -987,37 +536,14 @@ if st.button("Generar conciliación", type="primary"):
             return buf, diferencia
 
         # ── Ejecutar ──────────────────────────────────────────────────────────
-        meses_str = {"ene":1,"feb":2,"mar":3,"abr":4,"may":5,"jun":6,
-                     "jul":7,"ago":8,"sep":9,"oct":10,"nov":11,"dic":12}
-        # Intenta "01-MAR-2026", luego "MAR.2026" o "MAR 2026"
-        m = re.search(r"(\d{1,2})[\.\-]([A-Za-z]{3,4})[\.\-](\d{4})", uploaded_ext.name)
-        if m:
-            ano = int(m.group(3))
-            mes = meses_str.get(m.group(2).lower()[:3], 1)
-        else:
-            m2 = re.search(r"\b([A-Za-z]{3,4})[\.\-\s](\d{4})\b", uploaded_ext.name)
-            if m2:
-                ano = int(m2.group(2))
-                mes = meses_str.get(m2.group(1).lower()[:3], date.today().month)
-            else:
-                ano, mes = date.today().year, date.today().month
+        ext_bytes = uploaded_ext.read()
+        aux_bytes = uploaded_aux.read()
 
-        # Procesar extracto
-        df_ext, _images_ext = parse_extracto(ano, mes)
+        df_ext, saldo_ext = parse_extracto_excel(ext_bytes, uploaded_ext.name)
 
-        # 1) Buscar "Saldo Final" en OCR de últimas páginas (más confiable)
-        saldo_ext = _find_saldo_fitz(pdf_ext_path)
-
-        # 2) Fallback: saldo máximo de la tabla OCR (el saldo corriente crece hasta el final)
-        if saldo_ext is None and not df_ext.empty:
-            _ext_saldos = df_ext["saldo"].dropna()
-            if not _ext_saldos.empty:
-                saldo_ext = float(_ext_saldos.max())
-
-        # Procesar auxiliar — pdfplumber lee texto directo, sin OCR
-        df_inf, _images_aux = parse_auxiliar()
+        df_inf, _ = parse_auxiliar_excel(aux_bytes, uploaded_aux.name)
         _inf_saldos = df_inf["saldo"].dropna() if not df_inf.empty else pd.Series(dtype=float)
-        saldo_cont = float(_inf_saldos.iloc[-1]) if not _inf_saldos.empty else None
+        saldo_cont  = float(_inf_saldos.iloc[-1]) if not _inf_saldos.empty else None
 
         diferencia_saldos = round((saldo_ext or 0) - (saldo_cont or 0), 2)
         partida_faltante  = _buscar_partida(df_ext, df_inf, diferencia_saldos)
@@ -1027,19 +553,16 @@ if st.button("Generar conciliación", type="primary"):
             uploaded_ext.name, partida_faltante,
         )
 
-        os.unlink(pdf_ext_path)
-        os.unlink(pdf_aux_path)
-
     # ── Resultado ─────────────────────────────────────────────────────────────
     col1, col2, col3 = st.columns(3)
-    col1.metric("Saldo Extracto",      f"${saldo_ext:,.0f}"  if saldo_ext  else "—")
-    col2.metric("Saldo Contabilidad",  f"${saldo_cont:,.0f}" if saldo_cont else "—")
-    col3.metric("Diferencia",          f"${diferencia:,.0f}" if diferencia is not None else "—",
-                delta_color="off" if diferencia==0 else "inverse")
+    col1.metric("Saldo Extracto",     f"${saldo_ext:,.0f}"  if saldo_ext  else "—")
+    col2.metric("Saldo Contabilidad", f"${saldo_cont:,.0f}" if saldo_cont else "—")
+    col3.metric("Diferencia",         f"${diferencia:,.0f}" if diferencia is not None else "—",
+                delta_color="off" if diferencia == 0 else "inverse")
 
     n_ext = len(df_ext) if not df_ext.empty else 0
     n_aux = len(df_inf) if not df_inf.empty else 0
-    st.caption(f"Extracto: **{n_ext} movimientos** extraídos   |   Auxiliar: **{n_aux} movimientos** extraídos")
+    st.caption(f"Extracto: **{n_ext} movimientos**   |   Auxiliar: **{n_aux} movimientos**")
 
     if diferencia == 0:
         st.success("✅ Conciliación completa — los saldos cuadran perfectamente.")
@@ -1055,7 +578,8 @@ if st.button("Generar conciliación", type="primary"):
                 f"- Monto: **${partida_faltante['monto']:,.0f}** ({partida_faltante['tipo']})"
             )
 
-    nombre_salida = uploaded_ext.name.replace(".pdf", "_conciliacion.xlsx")
+    nombre_salida = re.sub(r"\.(xlsx|xls)$", "", uploaded_ext.name,
+                           flags=re.IGNORECASE) + "_conciliacion.xlsx"
     st.download_button(
         label="⬇️ Descargar Excel de conciliación",
         data=excel_buf,
@@ -1065,45 +589,23 @@ if st.button("Generar conciliación", type="primary"):
     )
 
     with st.expander("Ver movimientos del extracto"):
-        cols_ext = [c for c in ["fecha","dia","descripcion","debito","credito","saldo"] if c in df_ext.columns]
+        cols_ext = [c for c in ["fecha","dia","descripcion","debito","credito","saldo"]
+                    if c in df_ext.columns]
         if cols_ext:
             st.dataframe(df_ext[cols_ext], use_container_width=True)
         else:
-            st.warning("pdfplumber no extrajo filas del extracto — ver texto de debug abajo.")
-        debug = st.session_state.get("ext_debug", [])
-        if debug:
-            total_ext = sum(n for _,n,_ in debug)
-            pages_zero = [p for p,n,_ in debug if n == 0]
-            st.caption(
-                f"**Total filas extracto: {total_ext}** — "
-                + " | ".join(f"P{p}:{n}({m})" for p,n,m in debug)
-            )
-            if pages_zero:
-                st.warning(f"⚠️ Páginas sin filas: {pages_zero} — el OCR no pudo leer esas páginas")
-        sample = st.session_state.get("plumber_sample", [])
-        if sample:
-            st.caption("**Texto crudo del extracto (pág 1) — cópiame esto:**")
-            for ln in sample:
-                st.code(ln)
+            st.warning("No se extrajeron filas del extracto.")
+        dbg = st.session_state.get("ext_cols", "")
+        if dbg:
+            st.caption(f"Columnas detectadas: `{dbg}`")
 
-    with st.expander("Ver asientos del contador"):
-        cols_inf = [c for c in ["comprobante","fecha","descripcion","debito","credito","saldo"] if c in df_inf.columns]
+    with st.expander("Ver asientos del auxiliar"):
+        cols_inf = [c for c in ["comprobante","fecha","descripcion","debito","credito","saldo"]
+                    if c in df_inf.columns]
         if cols_inf:
             st.dataframe(df_inf[cols_inf], use_container_width=True)
         else:
-            st.warning("pdfplumber no extrajo filas del auxiliar.")
-        aux_sample = st.session_state.get("aux_sample", [])
-        if aux_sample:
-            st.caption("**Texto que leyó pdfplumber del auxiliar (pág 1) — cópiame esto:**")
-            for ln in aux_sample:
-                st.code(ln)
-        aux_rpp = st.session_state.get("aux_rows_per_page", [])
-        if aux_rpp:
-            total_aux = sum(n for _,n,_ in aux_rpp)
-            st.caption(
-                f"**Total filas auxiliar: {total_aux}** — "
-                + " | ".join(f"P{p}:{n}({m})" for p,n,m in aux_rpp)
-            )
-        col_split_dbg = st.session_state.get("col_split_debug", "")
-        if col_split_dbg:
-            st.caption(f"Detección columnas: `{col_split_dbg}`")
+            st.warning("No se extrajeron filas del auxiliar.")
+        dbg2 = st.session_state.get("aux_cols", "")
+        if dbg2:
+            st.caption(f"Columnas detectadas: `{dbg2}`")
