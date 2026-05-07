@@ -647,42 +647,44 @@ if st.button("Generar conciliación", type="primary"):
                 bucket = round(monto / 100) * 100
                 return any(abs(a - bucket) <= tol for a in lista)
 
-            # Banco < Contabilidad → el auxiliar tiene algo de más → buscar en auxiliar
-            # Banco > Contabilidad → al auxiliar le falta algo → buscar en extracto
+            # Banco < Auxiliar → hay un DÉBITO en auxiliar que el banco no tiene
+            #   (registraron una entrada en contabilidad que el banco no refleja)
+            # Banco > Auxiliar → hay un CRÉDITO en extracto que falta en auxiliar
+            #   (el banco registró un abono que contabilidad no capturó)
             if diferencia_saldos < 0:
-                # Buscar en AUXILIAR lo que NO está en el extracto
+                # Buscar DÉBITO en auxiliar sin par en extracto
                 candidatos = []
                 for _, row in df_inf.iterrows():
-                    for monto in [row.debito, row.credito]:
-                        if monto < 1000: continue
-                        dist = abs(monto - target)
-                        if dist <= tol_dif and not _tiene_par(monto, ext_montos):
-                            desc = getattr(row, "descripcion", "")
-                            comp = getattr(row, "comprobante", "")
-                            candidatos.append({
-                                "origen":      "registrado en auxiliar, no aparece en extracto bancario",
-                                "fecha":       row.fecha,
-                                "descripcion": f"{comp} {desc}".strip(),
-                                "monto":       monto,
-                                "tipo":        "DÉBITO" if monto == row.debito else "CRÉDITO",
-                                "dist_target": dist,
-                            })
+                    monto = row.debito
+                    if monto < 1000: continue
+                    dist = abs(monto - target)
+                    if dist <= tol_dif and not _tiene_par(monto, ext_montos):
+                        desc = getattr(row, "descripcion", "")
+                        comp = getattr(row, "comprobante", "")
+                        candidatos.append({
+                            "origen":      "DÉBITO en auxiliar sin respaldo en extracto bancario",
+                            "fecha":       row.fecha,
+                            "descripcion": f"{comp} {desc}".strip(),
+                            "monto":       monto,
+                            "tipo":        "DÉBITO",
+                            "dist_target": dist,
+                        })
             else:
-                # Buscar en EXTRACTO lo que NO está en el auxiliar
+                # Buscar CRÉDITO (abono) en extracto sin par en auxiliar
                 candidatos = []
                 for _, row in df_ext.iterrows():
-                    for monto in [row.debito, row.credito]:
-                        if monto < 1000: continue
-                        dist = abs(monto - target)
-                        if dist <= tol_dif and not _tiene_par(monto, aux_montos):
-                            candidatos.append({
-                                "origen":      "registrado en extracto bancario, no aparece en auxiliar",
-                                "fecha":       row.fecha,
-                                "descripcion": row.descripcion,
-                                "monto":       monto,
-                                "tipo":        "CARGO" if monto == row.debito else "ABONO",
-                                "dist_target": dist,
-                            })
+                    monto = row.credito
+                    if monto < 1000: continue
+                    dist = abs(monto - target)
+                    if dist <= tol_dif and not _tiene_par(monto, aux_montos):
+                        candidatos.append({
+                            "origen":      "CRÉDITO en extracto bancario sin registrar en auxiliar",
+                            "fecha":       row.fecha,
+                            "descripcion": row.descripcion,
+                            "monto":       monto,
+                            "tipo":        "CRÉDITO",
+                            "dist_target": dist,
+                        })
 
             if not candidatos:
                 return None
